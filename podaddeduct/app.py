@@ -138,10 +138,9 @@ _FEED_TTL = 60.0
 async def render_feed_response(feed: db.Feed, request: Request) -> Response:
     """Serve a custom RSS feed from local SQLite — no upstream I/O.
 
-    Every tracked episode is listed (capped by feed_item_limit). Enclosures
-    always point at /audio/{id}, which serves the clean file when ready and
-    otherwise 302-redirects to the publisher so Overcast never sees a
-    download failure.
+    Every Ready episode is listed (capped by feed_item_limit). Enclosures
+    always point at /audio/{id}. GUIDs are namespaced to this app so Overcast
+    does not merge them with the publisher's original show.
     """
     import time
 
@@ -158,7 +157,10 @@ async def render_feed_response(feed: db.Feed, request: Request) -> Response:
     # Fresh row so title/artwork/description reflect the latest background sync.
     feed = db.get_feed(feed.id) or feed
     limit = db.runtime_int("feed_item_limit", minimum=1, maximum=500)
-    episodes = db.list_episodes(feed.id)[: max(1, limit)]
+    episodes = [
+        e for e in db.list_episodes(feed.id)
+        if e.status in {"ready", "manual"}
+    ][: max(1, limit)]
     xml = generate_custom_feed_xml(feed, episodes, base)
     content = xml.encode("utf-8")
     _feed_cache[cache_key] = (time.monotonic(), content)

@@ -49,6 +49,23 @@ def enclosure_url_for(ep: db.Episode, public_base: str, served: Path | None = No
     return f"{base}?v={v}" if v else base
 
 
+def player_guid(ep: db.Episode) -> str:
+    """GUID unique to this app so Overcast doesn't merge with the publisher feed."""
+    return f"podaddeduct-{ep.id}"
+
+
+def _pubdate_out(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        dt = parsedate_to_datetime(text)
+        text = format_datetime(dt)
+    except Exception:
+        pass
+    return text.replace(" -0000", " GMT").replace(" +0000", " GMT")
+
+
 def slugify(text: str, fallback: str = "feed") -> str:
     s = SLUG_RE.sub("-", text.lower()).strip("-")
     return s[:60] or fallback
@@ -178,11 +195,7 @@ def rewrite_feed_xml(
             or ""
         )
         pub = entry_pub_date(entry) or ""
-        pub_out = pub
-        try:
-            pub_out = format_datetime(parsedate_to_datetime(pub))
-        except Exception:
-            pass
+        pub_out = _pubdate_out(pub)
 
         # Every listed episode is playable, so the enclosure always points
         # at our server — upstream bytes are never referenced.
@@ -221,7 +234,8 @@ def rewrite_feed_xml(
       <itunes:author>{author}</itunes:author>
       <itunes:explicit>false</itunes:explicit>
       {duration_tag}
-      <guid isPermaLink="false">{escape(guid)}</guid>
+      <guid isPermaLink="false">{escape(player_guid(ep))}</guid>
+      <link>{escape(enc_url)}</link>
       <pubDate>{escape(pub_out)}</pubDate>
       <enclosure url="{escape(enc_url)}" length="{escape(length)}" type="{escape(mime)}" />
     </item>"""
@@ -254,10 +268,8 @@ def generate_custom_feed_xml(
 ) -> str:
     """Build a lightweight RSS 2.0 feed from local episode rows.
 
-    No upstream XML is required — podcast apps get an instant, small custom
-    feed whose enclosures always point at /audio/{id}. Unready episodes are
-    fine to list: that route 302-redirects to the publisher until a clean
-    copy exists, so players never see a failed download.
+    No upstream XML is required. Callers should pass Ready episodes so
+    podcast apps only see playable clean files.
     """
     channel_title = _xml_text(feed.title or feed.slug)
     channel_desc = _xml_text(feed.description or "")
@@ -272,12 +284,7 @@ def generate_custom_feed_xml(
     for ep in episodes:
         title = _xml_text(ep.title or "Episode")
         desc = _xml_text(ep.description or "")
-        pub_out = ep.pub_date or ""
-        if pub_out:
-            try:
-                pub_out = format_datetime(parsedate_to_datetime(pub_out))
-            except Exception:
-                pass
+        pub_out = _pubdate_out(ep.pub_date or "")
 
         enc_url = enclosure_url_for(ep, public_base)
         length = str(ep.size_bytes or 0)
@@ -303,7 +310,8 @@ def generate_custom_feed_xml(
       <itunes:author>{author}</itunes:author>
       <itunes:explicit>false</itunes:explicit>
       {duration_tag}
-      <guid isPermaLink="false">{escape(ep.guid)}</guid>
+      <guid isPermaLink="false">{escape(player_guid(ep))}</guid>
+      <link>{escape(enc_url)}</link>
       <pubDate>{escape(pub_out)}</pubDate>
       <enclosure url="{escape(enc_url)}" length="{escape(length)}" type="audio/mpeg" />
     </item>"""

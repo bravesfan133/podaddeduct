@@ -92,7 +92,7 @@ def test_feed_render_local_no_upstream(tmp_path, monkeypatch):
         assert r2.text == r1.text
         assert calls["n"] == 0
 
-        # Ready + pending episodes both appear after cache clear; still no upstream fetch.
+        # Only Ready episodes appear in the player feed.
         ep = db.upsert_episode(
             feed.id, guid="g2", title="Ep Two",
             enclosure_url="https://example.com/e2.mp3",
@@ -103,20 +103,29 @@ def test_feed_render_local_no_upstream(tmp_path, monkeypatch):
             enclosure_url="https://example.com/e1.mp3",
             pub_date="Mon, 01 Sep 2025 00:00:00 GMT",
         )
-        clean = tmp_path / "audio" / f"{ep.id}.clean.mp3"
-        clean.write_bytes(b"x" * 64)
-        db.update_episode(ep.id, clean_audio_path=str(clean), status="ready",
-                          duration_seconds=100.0, description="Two notes")
+        ready2 = db.upsert_episode(
+            feed.id, guid="g3", title="Ep Three",
+            enclosure_url="https://example.com/e3.mp3",
+            pub_date="Wed, 03 Sep 2025 00:00:00 GMT",
+        )
+        for row in (ep, ready2):
+            clean = tmp_path / "audio" / f"{row.id}.clean.mp3"
+            clean.write_bytes(b"x" * 64)
+            db.update_episode(row.id, clean_audio_path=str(clean), status="ready",
+                              duration_seconds=100.0)
         app_mod._feed_cache.clear()
         r3 = client.get("/feeds/mini.xml")
         assert r3.status_code == 200
         assert r3.text.count("<item>") == 2
         assert "Ep Two" in r3.text
-        assert "Ep One" in r3.text
+        assert "Ep Three" in r3.text
+        assert "Ep One" not in r3.text
         assert f"/audio/{ep.id}" in r3.text
-        assert f"/audio/{pending.id}" in r3.text
-        assert 'length="64"' in r3.text
-        assert pending.status == "pending" or db.get_episode(pending.id).status == "pending"
+        assert f"/audio/{ready2.id}" in r3.text
+        assert f"/audio/{pending.id}" not in r3.text
+        assert f"podaddeduct-{ep.id}" in r3.text
+        assert f"podaddeduct-{ready2.id}" in r3.text
+        assert db.get_episode(pending.id).status == "pending"
     assert calls["n"] == 0
     app_mod._feed_cache.clear()
 

@@ -26,7 +26,7 @@ podaddeduct is a **cache, not an archive** (default 3 GB):
 - Tune it in **Settings**: max storage, keep-latest, delete-after, check-for-new interval.
 - Per show: automatic prepare on/off and keep-latest.
 
-Podcast-app refresh checks (`HEAD`) never start work. First play of an unprepared episode returns **503** until cleaning finishes — turn on auto-prepare so that wait is rare.
+Podcast-app refresh checks (`HEAD`) never start work. The custom RSS lists **Ready** episodes only. Unprepared episodes stay off the player feed until cleaning finishes.
 
 ## Ad detection
 

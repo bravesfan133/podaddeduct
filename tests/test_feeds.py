@@ -40,14 +40,16 @@ def test_feed_rewrite_points_at_clean_audio(tmp_path, monkeypatch):
     xml = rewrite_feed_xml(parsed, feed=feed, episodes_by_guid={"g1": ep},
                            public_base="http://192.168.0.93:8080")
     assert f"/audio/{ep.id}" in xml
+    assert f'podaddeduct-{ep.id}' in xml
+    assert "<link>" in xml
     assert f"/audio/{ep.id}?v=" in xml
     assert 'length="100"' in xml  # clean file size, not upstream 999
     assert "<itunes:duration>300</itunes:duration>" in xml
     assert "podcast:chapters" not in xml
 
 
-def test_generate_custom_feed_includes_pending(tmp_path, monkeypatch):
-    """Pending episodes stay in the player feed; /audio 302s until cleaned."""
+def test_generate_custom_feed_lists_passed_episodes(tmp_path, monkeypatch):
+    """XML builder lists whatever rows it is given."""
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     (tmp_path / "audio").mkdir()
     db.init_db()
@@ -80,7 +82,7 @@ def test_generate_custom_feed_includes_pending(tmp_path, monkeypatch):
     ready = db.get_episode(ready.id)
     assert ready
 
-    # Ready-only helper still filters; the player feed lists every tracked row.
+    # Ready-only helper still filters; the XML builder lists whatever it is given.
     ready_eps = db.list_ready_episodes(feed.id)
     assert [e.guid for e in ready_eps] == ["g-ready"]
     all_eps = db.list_episodes(feed.id)
@@ -93,6 +95,9 @@ def test_generate_custom_feed_includes_pending(tmp_path, monkeypatch):
     assert "Ready Ep" in xml
     assert "Pending Ep" in xml
     assert f"/audio/{ready.id}" in xml
+    assert f'podaddeduct-{ready.id}' in xml
+    assert f'podaddeduct-{pending.id}' in xml
+    assert "<link>" in xml
     assert f"/audio/{ready.id}?v=" in xml
     assert f"/audio/{pending.id}" in xml
     assert 'length="50"' in xml
