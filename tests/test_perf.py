@@ -75,36 +75,28 @@ def test_feed_render_fetches_once_and_caches(tmp_path, monkeypatch):
     ):
         r1 = client.get("/feeds/mini.xml")
         assert r1.status_code == 200
-        # Strict feed: nothing clean yet → no items, but only one fetch.
-        assert r1.text.count("<item>") == 0
+        # Full listing like a normal feed: both episodes, newest first,
+        # all pointing at /audio — even with nothing cleaned yet.
+        assert r1.text.count("<item>") == 2
+        assert r1.text.index("Ep Two") < r1.text.index("Ep One")
         assert calls["n"] == 1
-        # Mark the newest episode clean → it (and only it) appears, newest first.
+        # Cached: same bytes, no new fetch.
+        r2 = client.get("/feeds/mini.xml")
+        assert r2.status_code == 200
+        assert r2.text == r1.text
+        # Cleaned episodes advertise the real file size.
         ep = db.get_episode_by_guid(feed.id, "g2")
         clean = tmp_path / "audio" / f"{ep.id}.clean.mp3"
         clean.write_bytes(b"x" * 64)
         db.update_episode(ep.id, clean_audio_path=str(clean), status="ready",
                           duration_seconds=100.0)
         app_mod._feed_cache.clear()
-        r2 = client.get("/feeds/mini.xml")
-        assert r2.status_code == 200
-        assert r2.text.count("<item>") == 1
-        assert "Ep Two" in r2.text
-        assert f"/audio/{ep.id}" in r2.text
-        # Cached: same bytes, no new fetch.
         r3 = client.get("/feeds/mini.xml")
         assert r3.status_code == 200
-        assert r3.text == r2.text
-        # Both clean → newest first in the served feed.
-        ep1 = db.get_episode_by_guid(feed.id, "g1")
-        clean1 = tmp_path / "audio" / f"{ep1.id}.clean.mp3"
-        clean1.write_bytes(b"x" * 64)
-        db.update_episode(ep1.id, clean_audio_path=str(clean1), status="ready",
-                          duration_seconds=100.0)
-        app_mod._feed_cache.clear()
-        r4 = client.get("/feeds/mini.xml")
-        assert r4.text.count("<item>") == 2
-        assert r4.text.index("Ep Two") < r4.text.index("Ep One")
-    assert calls["n"] == 3
+        assert r3.text.count("<item>") == 2
+        assert f"/audio/{ep.id}" in r3.text
+        assert 'length="64"' in r3.text
+    assert calls["n"] == 2
     app_mod._feed_cache.clear()
 
 

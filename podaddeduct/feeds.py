@@ -109,23 +109,11 @@ def rewrite_feed_xml(
     limit = item_limit if item_limit is not None else db.runtime_int("feed_item_limit", minimum=1, maximum=500)
     entries = list(parsed.entries[: max(1, limit)])
 
-    # Strict feed: only episodes with a clean file on disk appear, so the
-    # player can never fetch audio with ads. The one exception is shows in
-    # chapters mode (explicit user choice): ready episodes serve the
-    # original with chapter marks since no clean file can ever exist.
-    chapters_ok = (db.get_feed_settings(feed).get("mode") == "chapters")
-
-    def _playable(ep: db.Episode | None) -> bool:
-        if ep is None:
-            return False
-        if db.has_clean_audio(ep):
-            return True
-        return bool(
-            chapters_ok
-            and ep.status in {"ready", "manual"}
-            and db.served_audio_path(ep)
-        )
-
+    # Every tracked episode is listed, newest first — exactly like a normal
+    # podcast feed. Tapping an unready episode makes the player retry
+    # /audio/{id} until the clean file is ready (strict: upstream bytes
+    # with ads are never served). Entries with no local row yet are
+    # skipped rather than linked upstream.
     items: list[str] = []
     for entry in entries:
         enclosure = entry_enclosure(entry)
@@ -133,9 +121,8 @@ def rewrite_feed_xml(
             continue
         guid = entry_guid(entry, enclosure)
         ep = episodes_by_guid.get(guid)
-        if not _playable(ep):
+        if ep is None:
             continue
-        assert ep is not None
         title = _xml_text(getattr(entry, "title", None) or ep.title or "Episode")
         desc = _xml_text(getattr(entry, "summary", None) or getattr(entry, "description", None) or "")
         pub = entry_pub_date(entry) or ""

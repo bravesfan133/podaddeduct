@@ -49,7 +49,7 @@
     {% if has_clean %}
     <p class="muted ok" style="margin:0.35rem 0 0">Clean copy — the {{ ranges|length }} marked section(s) below were cut out.</p>
     {% elif episode.status == 'working' %}
-    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — playing the original for now. This page refreshes; the clean copy replaces it.</p>
+    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — this page refreshes itself, and your podcast app picks up the clean file automatically.</p>
     {% else %}
     <p class="muted" style="margin:0.35rem 0 0">Original audio (no ads found, or chapters-only mode).</p>
     {% endif %}
