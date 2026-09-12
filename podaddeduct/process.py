@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import traceback
 from pathlib import Path
 
@@ -10,12 +11,94 @@ from . import db
 from .config import settings
 from .cut import clean_path_for, cut_ads
 from .decode import load_mono_pcm
-from .download import download_file
+from .download import complete_marker_for, download_file
 from .intervals import Interval
 from .seed import filter_min_duration, find_ads_with_zen, snap_to_silence
-from .stt import transcript_path_for, transcribe_audio
 
 logger = logging.getLogger("podaddeduct.process")
+
+# In-memory view of what the single worker is doing right now, for
+# logs/health/episode-page. Shape:
+# {"episode_id": int, "stage": str, "started_at": float, "detail": str}
+_current: dict | None = None
+
+
+def _job_start(episode_id: int) -> None:
+    global _current
+    _current = {"episode_id": episode_id, "stage": "queued", "started_at": time.monotonic(), "detail": ""}
+
+
+def _job_stage(stage: str, detail: str = "") -> None:
+    if _current is not None:
+        _current["stage"] = stage
+        _current["detail"] = detail
+        _current["started_at"] = time.monotonic()
+
+
+def _job_elapsed() -> float:
+    if not _current:
+        return 0.0
+    return max(0.0, time.monotonic() - _current["started_at"])
+
+
+def _job_done(episode_id: int) -> None:
+    global _current
+    if _current and _current.get("episode_id") == episode_id:
+        _current = None
+
+
+def describe_job(job: dict | None = None) -> str:
+    """One plain line for the episode page, e.g. 'Downloading… 45/210 MB'."""
+    job = job if job is not None else _current
+    if not job:
+        return ""
+    stage = job.get("stage") or ""
+    detail = job.get("detail") or ""
+    if stage == "queued":
+        return "Waiting in line…"
+    if stage == "downloading":
+        return f"Downloading… {detail}" if detail else "Downloading…"
+    if stage == "decoding":
+        return "Reading audio…"
+    if stage == "transcribing":
+        return "Transcribing speech… (slowest step, can take a while)"
+    if stage == "detecting":
+        return "Finding ads…"
+    if stage == "cutting":
+        return "Cutting clean file…"
+    if stage == "finishing":
+        return "Almost done…"
+    return "Working…"
+
+
+def queue_position(episode_id: int) -> int | None:
+    """1-based position among waiting jobs, or None if not queued."""
+    q = _queue
+    if q is None:
+        return None
+    try:
+        waiting = sorted(q._queue)
+    except Exception:
+        return None
+    for i, (_, _, eid) in enumerate(waiting):
+        if eid == episode_id:
+            return i + 1
+    return None
+
+
+def worker_state() -> dict:
+    """Snapshot for /api/health: current job (with elapsed) + waiting ids."""
+    q = _queue
+    waiting: list[int] = []
+    if q is not None:
+        try:
+            waiting = [eid for _, _, eid in sorted(q._queue)]
+        except Exception:
+            waiting = []
+    current = None
+    if _current:
+        current = {**_current, "elapsed": round(_job_elapsed(), 1)}
+    return {"current": current, "queued": waiting, "alive": _worker_started}
 
 _queue: asyncio.PriorityQueue[tuple[int, int, int]] | None = None
 _worker_started = False
@@ -96,12 +179,14 @@ async def _worker_loop() -> None:
     q = get_queue()
     while True:
         _, _, episode_id = await q.get()
+        _job_start(episode_id)
         try:
             await process_episode(episode_id)
         except Exception:
             logger.exception("Failed processing episode %s", episode_id)
             db.update_episode(episode_id, status="error", error=traceback.format_exc()[-2000:])
         finally:
+            _job_done(episode_id)
             _queued.discard(episode_id)
             q.task_done()
 
@@ -141,14 +226,38 @@ async def process_episode(episode_id: int) -> None:
 
     db.update_episode(episode_id, status="working", error=None)
     audio_path = Path(ep.audio_path) if ep.audio_path else audio_path_for(episode_id)
+    if audio_path.exists() and not complete_marker_for(audio_path).exists():
+        # Leftover partial from a killed/failed download — never trust it.
+        logger.warning("episode %s: dropping incomplete download, re-fetching", episode_id)
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     if not audio_path.exists():
-        audio_path = await download_file(ep.enclosure_url, audio_path_for(episode_id))
+        _job_stage("downloading")
+        t0 = time.monotonic()
+
+        def _progress(done: int, total: int) -> None:
+            if _current is not None:
+                if total:
+                    _current["detail"] = f"{done // 1024**2}/{total // 1024**2} MB"
+                else:
+                    _current["detail"] = f"{done // 1024**2} MB"
+
+        audio_path = await download_file(
+            ep.enclosure_url, audio_path_for(episode_id), progress=_progress
+        )
+        size_mb = audio_path.stat().st_size // 1024**2 if audio_path.exists() else 0
+        logger.info("episode %s downloaded %d MB in %.0fs", episode_id, size_mb, time.monotonic() - t0)
         db.update_episode(episode_id, audio_path=str(audio_path))
 
     saved = db.get_ad_ranges(db.get_episode(episode_id) or ep)
     if saved and not _queued_reseed(episode_id):
         # Re-cut from saved marks (janitor evicted the file earlier).
+        _job_stage("cutting")
+        t0 = time.monotonic()
         await asyncio.to_thread(_recut_saved, episode_id, audio_path, saved)
+        logger.info("episode %s re-cut done in %.0fs", episode_id, time.monotonic() - t0)
     else:
         await asyncio.to_thread(_detect_and_cut, episode_id, audio_path)
 
@@ -176,8 +285,10 @@ def _recut_saved(episode_id: int, audio_path: Path, saved: list[dict]) -> None:
 
 
 def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
+    t_all = time.monotonic()
     logger.info("episode %s detecting ads (STT+Zen)", episode_id)
     db.update_episode(episode_id, status="working", error="Transcribing…")
+    _job_stage("decoding")
     pcm, sr = load_mono_pcm(audio_path)
     duration = len(pcm) / float(sr)
 
@@ -186,9 +297,16 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     feed = db.get_feed(ep.feed_id) if ep else None
     mode = db.get_feed_settings(feed).get("mode", "cut") if feed else "cut"
 
+    _job_stage("transcribing")
+    t0 = time.monotonic()
     transcript = transcribe_audio(audio_path, transcript_path_for(episode_id), force=False)
+    n_sent = len((transcript.get("sentences") or []))
+    logger.info("episode %s transcribed %d sentences in %.0fs", episode_id, n_sent, time.monotonic() - t0)
     db.update_episode(episode_id, status="working", error="Finding ads…")
+    _job_stage("detecting")
+    t0 = time.monotonic()
     zen_ads = find_ads_with_zen(transcript)
+    logger.info("episode %s ad detection found %d ranges in %.0fs", episode_id, len(zen_ads), time.monotonic() - t0)
     ads = snap_to_silence(zen_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
     ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
 
@@ -209,7 +327,7 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         return
 
     _finalize(episode_id, audio_path, duration, ads)
-    logger.info("episode %s done with %d ad ranges", episode_id, len(ads))
+    logger.info("episode %s done with %d ad ranges (total %.0fs)", episode_id, len(ads), time.monotonic() - t_all)
 
 
 def _finalize(
@@ -220,6 +338,7 @@ def _finalize(
 ) -> None:
     from .chapters import intervals_to_dicts
 
+    _job_stage("finishing")
     ad_dicts = intervals_to_dicts(ads)
     fields: dict = {
         "audio_path": str(audio_path),
@@ -232,7 +351,10 @@ def _finalize(
     clean_path = clean_path_for(episode_id)
     if ads:
         try:
+            _job_stage("cutting")
+            t0 = time.monotonic()
             cut_ads(audio_path, ads, clean_path, duration=duration)
+            logger.info("episode %s ffmpeg cut done in %.0fs", episode_id, time.monotonic() - t0)
             fields["clean_audio_path"] = str(clean_path)
             fields["size_bytes"] = _file_size(clean_path)
         except Exception as exc:

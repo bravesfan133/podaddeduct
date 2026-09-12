@@ -433,7 +433,7 @@ async def api_storage(request: Request) -> JSONResponse:
 async def api_health(request: Request) -> JSONResponse:
     if not _authed(request):
         raise HTTPException(401, "Sign in first.")
-    from .process import queue_depth
+    from .process import queue_depth, worker_state
     from .stt import backend_status
 
     stt = backend_status()
@@ -446,6 +446,7 @@ async def api_health(request: Request) -> JSONResponse:
         "ok": bool(stt["ok"]),
         "stt": stt,
         "queue_depth": queue_depth(),
+        "worker": worker_state(),
         "disk": disk,
     })
 
@@ -459,6 +460,17 @@ async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
         raise HTTPException(404, "Episode not found")
     ranges = db.get_ad_ranges(ep)
     saved = round(sum(max(0.0, r["end"] - r["start"]) for r in ranges), 1) if ranges else 0.0
+    from .process import describe_job, queue_position, worker_state
+
+    st = worker_state()
+    job_text = ""
+    queue_pos = queue_position(episode_id)
+    cur = st.get("current") or {}
+    if cur.get("episode_id") == episode_id:
+        job_text = describe_job(cur)
+        queue_pos = None
+    elif queue_pos is not None:
+        job_text = f"#{queue_pos} in line"
     return JSONResponse(
         {
             "status": ep.status,
@@ -467,6 +479,8 @@ async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
             "ads": len(ranges),
             "saved_seconds": saved,
             "error": ep.error,
+            "job_text": job_text,
+            "queue_position": queue_pos,
         }
     )
 

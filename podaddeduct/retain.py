@@ -35,8 +35,14 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 
 def _drop_files(ep: db.Episode, *, reason: str) -> bool:
+    from .download import complete_marker_for
+
     removed = False
-    for p in (ep.clean_audio_path, ep.audio_path):
+    paths: list[str | Path | None] = [ep.clean_audio_path, ep.audio_path]
+    if ep.audio_path:
+        # Download-completeness marker: without it the next run re-fetches.
+        paths.append(complete_marker_for(Path(ep.audio_path)))
+    for p in paths:
         if p:
             try:
                 Path(p).unlink(missing_ok=True)

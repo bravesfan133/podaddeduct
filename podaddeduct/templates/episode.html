@@ -57,10 +57,13 @@
     <p class="muted ok" style="margin:0.35rem 0 0">Clean copy — the {{ ranges|length }} marked section(s) below were cut out.</p>
     {% elif episode.status == 'working' %}
     <p class="muted" style="margin:0.35rem 0 0">Still cleaning — this page refreshes itself, and your podcast app picks up the clean file automatically.</p>
+    <p class="muted" id="liveStatus" style="margin:0.35rem 0 0"></p>
+    {% elif episode.status == 'error' %}
+    <p class="muted" style="margin:0.35rem 0 0">Last attempt failed — see above, then press Prepare to retry.</p>
     {% else %}
     <p class="muted" style="margin:0.35rem 0 0">Original audio (no ads found, or chapters-only mode).</p>
     {% endif %}
-    {% if has_audio %}<audio id="player" controls preload="metadata" src="/audio/{{ episode.id }}"></audio>{% endif %}
+    {% if has_audio and (has_clean or episode.status in ('ready', 'manual')) %}<audio id="player" controls preload="metadata" src="/audio/{{ episode.id }}"></audio>{% endif %}
     <p class="muted" id="nowPlaying" style="margin-bottom:0"></p>
     <form method="post" action="/episodes/{{ episode.id }}/recheck" style="margin-top:0.75rem">
       <button class="ghost" type="submit">Re-check for ads</button>
@@ -122,7 +125,9 @@ async function loadChapters() {
   } catch (e) {}
   try {
     const s = await (await fetch('/api/episodes/{{ episode.id }}/status')).json();
-    if (s.status === 'working') setTimeout(() => location.reload(), 6000);
+    const live = document.getElementById('liveStatus');
+    if (live && s.job_text) live.textContent = s.job_text;
+    if (s.status === 'working') setTimeout(() => location.reload(), 8000);
     else if (s.status === 'ready' && !{% if has_audio %}true{% else %}false{% endif %}) setTimeout(() => location.reload(), 4000);
   } catch (e) {}
 }

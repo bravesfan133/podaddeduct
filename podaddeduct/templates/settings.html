@@ -193,6 +193,10 @@ if (backendSel) {
     bits.push(s.ffmpeg ? 'ffmpeg ok' : 'ffmpeg MISSING');
     if (d.disk && d.disk.free != null) bits.push(`${(d.disk.free / 1024 ** 3).toFixed(1)} GB free`);
     bits.push(`queue: ${d.queue_depth}`);
+    if (d.worker && d.worker.current) {
+      const c = d.worker.current;
+      bits.push(`working on episode ${c.episode_id} (${c.stage}, ${Math.round(c.elapsed || 0)}s)`);
+    }
     el.textContent = (d.ok ? '✓ ' : '✗ ') + bits.join(' · ');
     el.style.color = d.ok ? 'var(--ok)' : 'var(--err)';
   } catch (e) {
