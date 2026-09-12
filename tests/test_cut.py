@@ -31,6 +31,8 @@ def test_build_ffmpeg_cmd_shape():
     assert cmd[0] == "/usr/bin/ffmpeg"
     assert "-filter_complex" in cmd
     assert "-c:a" in cmd and "libmp3lame" in cmd
+    assert "-map_metadata" in cmd
+    assert "-id3v2_version" in cmd
     assert str(Path("out.clean.mp3")) in cmd
 
 

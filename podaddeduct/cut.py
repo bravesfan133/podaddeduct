@@ -54,6 +54,8 @@ def build_ffmpeg_cmd(
     bitrate: str = "128k",
 ) -> list[str]:
     filt = build_atrim_filter(content)
+    # -map_metadata 0 keeps ID3 tags (title/artist) from the source.
+    # Cover art is often a video/attached_pic stream; map it if present.
     return [
         ffmpeg,
         "-y",
@@ -63,10 +65,18 @@ def build_ffmpeg_cmd(
         filt,
         "-map",
         "[outa]",
+        "-map",
+        "0:v?",
         "-c:a",
         "libmp3lame",
         "-b:a",
         bitrate,
+        "-c:v",
+        "copy",
+        "-map_metadata",
+        "0",
+        "-id3v2_version",
+        "3",
         str(dest),
     ]
 

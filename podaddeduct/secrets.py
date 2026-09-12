@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .config import settings
@@ -41,20 +42,53 @@ def save_secrets(updates: dict) -> dict:
     return current
 
 
-def get_zen_api_key() -> str | None:
-    stored = (load_secrets().get("zen_api_key") or "").strip()
-    return stored or None
+def get_gemini_api_key() -> str | None:
+    """UI-saved key first, then GEMINI_API_KEY / GOOGLE_API_KEY env."""
+    stored = (load_secrets().get("gemini_api_key") or "").strip()
+    if stored:
+        return stored
+    env = (settings.gemini_api_key or "").strip()
+    if env:
+        return env
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        val = (os.environ.get(name) or "").strip()
+        if val:
+            return val
+    return None
 
 
-def set_zen_api_key(key: str | None) -> None:
+def set_gemini_api_key(key: str | None) -> None:
     key = (key or "").strip()
-    save_secrets({"zen_api_key": key or None})
+    save_secrets({"gemini_api_key": key or None})
+
+
+def gemini_key_status() -> dict:
+    """Safe status for UI — never returns the raw key."""
+    stored = (load_secrets().get("gemini_api_key") or "").strip()
+    env = (settings.gemini_api_key or "").strip()
+    if not env:
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            env = (os.environ.get(name) or "").strip()
+            if env:
+                break
+    source = None
+    hint = ""
+    if stored:
+        source = "ui"
+        hint = stored[:6] + "…" + stored[-4:] if len(stored) > 12 else "••••"
+    elif env:
+        source = "env"
+        hint = env[:6] + "…" + env[-4:] if len(env) > 12 else "••••"
+    return {
+        "configured": bool(stored or env),
+        "source": source,
+        "hint": hint,
+        "model": _db.runtime_str("gemini_model") or "gemini-2.5-flash",
+    }
 
 
 def get_groq_api_key() -> str | None:
-    """UI-saved key first, then GROQ_API_KEY env."""
-    import os
-
+    """UI-saved key first, then GROQ_API_KEY env. Used only for optional cloud Whisper STT."""
     stored = (load_secrets().get("groq_api_key") or "").strip()
     if stored:
         return stored
@@ -69,8 +103,6 @@ def set_groq_api_key(key: str | None) -> None:
 
 def groq_key_status() -> dict:
     stored = bool((load_secrets().get("groq_api_key") or "").strip())
-    import os
-
     env = bool((os.environ.get("GROQ_API_KEY") or "").strip())
     source = "ui" if stored else ("env" if env else None)
     return {"configured": bool(stored or env), "source": source}
@@ -95,39 +127,3 @@ def password_source() -> str | None:
 
 def set_app_password(value: str) -> None:
     save_secrets({"app_password": value})
-
-
-def zen_key_status() -> dict:
-    """Safe status for UI — never returns the raw key."""
-    stored = get_zen_api_key()
-    env = (settings.zen_api_key or "").strip()
-    auth_fallback = False
-    if not stored and not env:
-        auth_path = Path(settings.zen_auth_path).expanduser()
-        if auth_path.exists():
-            try:
-                data = json.loads(auth_path.read_text(encoding="utf-8"))
-                for provider in ("opencode", "opencode-go"):
-                    entry = data.get(provider)
-                    if isinstance(entry, dict) and entry.get("key"):
-                        auth_fallback = True
-                        break
-            except (OSError, json.JSONDecodeError):
-                pass
-    source = None
-    hint = ""
-    if stored:
-        source = "ui"
-        hint = stored[:6] + "…" + stored[-4:] if len(stored) > 12 else "••••"
-    elif env:
-        source = "env"
-        hint = env[:6] + "…" + env[-4:] if len(env) > 12 else "••••"
-    elif auth_fallback:
-        source = "opencode-auth"
-        hint = "from OpenCode login"
-    return {
-        "configured": bool(stored or env or auth_fallback),
-        "source": source,
-        "hint": hint,
-        "model": _db.runtime_str("zen_model") or "big-pickle",
-    }

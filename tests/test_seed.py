@@ -86,51 +86,34 @@ def test_leftover_transcript_drops_covered():
     assert not any("brought to you" in t for t in texts)
 
 
-def test_find_ads_with_zen_mocked():
-    from podaddeduct import db as db_mod
+def test_find_ads_with_gemini_mocked():
     from podaddeduct import seed as seed_mod
 
-    def fake_chat(api_key, model, user_content):
+    def fake_gemini(api_key, model, user_content):
         if "Midroll" in user_content or "car commercial" in user_content:
             return '[{"start": 400.0, "end": 445.0}]'
         return "[]"
 
-    real_runtime_int = db_mod.runtime_int
-
-    def fake_runtime_int(key, **kwargs):
-        if key == "zen_chunk_chars":
-            return 120
-        return real_runtime_int(key, **kwargs)
-
     with (
-        patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
-        patch.object(seed_mod, "_chat_completions", side_effect=fake_chat),
-        patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
         ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
-    # Heuristic covers the sponsor block; LLM covers midroll leftover.
+    # Heuristic covers the sponsor block; Gemini covers midroll leftover.
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
 
 
 def test_find_ads_progress_callback():
-    from podaddeduct import db as db_mod
     from podaddeduct import seed as seed_mod
 
     seen = []
 
-    def fake_chat(api_key, model, user_content):
+    def fake_gemini(api_key, model, user_content):
         return "[]"
 
-    real_runtime_int = db_mod.runtime_int
-
-    def fake_runtime_int(key, **kwargs):
-        if key == "zen_chunk_chars":
-            return 120
-        return real_runtime_int(key, **kwargs)
-
-    # Transcript with no heuristic hits so LLM runs on all chunks.
+    # Transcript with no heuristic hits so Gemini runs once.
     plain = {
         "sentences": [
             {"text": "Baseball talk one.", "start": 0.0, "end": 10.0},
@@ -140,18 +123,16 @@ def test_find_ads_progress_callback():
     }
 
     with (
-        patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
-        patch.object(seed_mod, "_chat_completions", side_effect=fake_chat),
-        patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
         seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
-    assert [d for d, _ in seen] == list(range(1, len(seen) + 1))
-    assert len({t for _, t in seen}) == 1, "total must be stable across chunks"
+    assert seen[-1] == (1, 1)
 
 
-def test_default_chunk_chars_reasonable():
+def test_default_gemini_model():
     from podaddeduct.config import Settings
 
-    default = Settings.model_fields["zen_chunk_chars"].default
-    assert 1000 <= default <= 20000
+    default = Settings.model_fields["gemini_model"].default
+    assert default == "gemini-2.5-flash"

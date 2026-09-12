@@ -17,11 +17,11 @@ def _setup(tmp_path, monkeypatch):
 
 def test_kv_overrides_env_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    assert db.models_to_try()[0] == settings.zen_model
-    db.set_global_settings({"zen_model": "custom-model-x", "zen_fallback_model": "custom-fb"})
-    assert db.models_to_try() == ["custom-model-x", "custom-fb"]
-    db.clear_global_settings(["zen_model", "zen_fallback_model"])
-    assert db.models_to_try()[0] == settings.zen_model
+    assert db.models_to_try() == [settings.gemini_model]
+    db.set_global_settings({"gemini_model": "gemini-2.0-flash"})
+    assert db.models_to_try() == ["gemini-2.0-flash"]
+    db.clear_global_settings(["gemini_model"])
+    assert db.models_to_try() == [settings.gemini_model]
 
 
 def test_runtime_coercion(tmp_path, monkeypatch):
@@ -55,7 +55,7 @@ def test_global_save_accepts_new_fields(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "min_ad_seconds": "12", "zen_model": "m1",
+            data={"settings_form": "1", "min_ad_seconds": "12", "gemini_model": "gemini-2.5-flash",
                   "public_base_url": "https://podcasts.example.com",
                   "delete_original_after_cut": "on"},
             follow_redirects=False,
@@ -63,7 +63,7 @@ def test_global_save_accepts_new_fields(tmp_path, monkeypatch):
         assert r.status_code == 303
         assert r.headers["location"].startswith("/settings?saved=settings")
     assert db.runtime_float("min_ad_seconds") == 12.0
-    assert db.runtime_str("zen_model") == "m1"
+    assert db.runtime_str("gemini_model") == "gemini-2.5-flash"
     assert db.runtime_bool("delete_original_after_cut") is True
     assert db.runtime_str("public_base_url") == "https://podcasts.example.com"
 
@@ -127,27 +127,16 @@ def test_password_set_change_remove(tmp_path, monkeypatch):
         assert client.get("/").status_code == 200
 
 
-def test_zen_models_falls_back_without_key(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import seed as seed_mod
-
-    with patch.object(seed_mod, "resolve_zen_api_key", return_value=None):
-        out = seed_mod.fetch_zen_models()
-    assert out["live"] is False
-    assert "big-pickle" in out["models"]
-    assert "mimo-v2.5-free" in out["models"]
-
-
-def test_zen_test_reports_no_key(tmp_path, monkeypatch):
+def test_gemini_test_reports_no_key(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
     from podaddeduct.app import app
 
     with (
-        patch.object(seed_mod, "resolve_zen_api_key", return_value=None),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value=None),
         TestClient(app) as client,
     ):
-        r = client.post("/api/zen-test", json={})
+        r = client.post("/api/gemini-test", json={})
         assert r.status_code == 200
         assert r.json()["ok"] is False
 
@@ -159,7 +148,7 @@ def test_settings_page_renders(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.get("/settings")
         assert r.status_code == 200
-        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v"):
+        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v", "Gemini"):
             assert section in r.text, section
 
 
@@ -173,7 +162,7 @@ def test_mutating_routes_need_login(tmp_path, monkeypatch):
         with TestClient(app, follow_redirects=False) as client:
             assert client.post("/settings/global", data={}).status_code == 303
             assert client.post("/feeds", data={"upstream_url": "https://x.test/rss"}).status_code == 303
-            assert client.post("/settings/zen-key", data={}).status_code == 303
+            assert client.post("/settings/gemini-key", data={}).status_code == 303
             assert client.post("/import-opml", files={"file": ("a.opml", b"<opml/>")}).status_code == 303
             assert client.get("/api/search?q=x").status_code == 401
             assert client.get("/api/storage").status_code == 401

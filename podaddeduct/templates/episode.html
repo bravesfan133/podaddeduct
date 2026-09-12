@@ -78,12 +78,12 @@
   </div>
   {% endif %}
 
-  {% if not zen.configured %}
+  {% if not gemini.configured %}
   <div class="player">
-    <b>One-time setup: Zen API key</b>
-    <p class="muted">Needed so the app can spot sponsor reads when the publisher didn't mark them. <a href="https://opencode.ai/auth" target="_blank" rel="noopener">Get a key</a>, paste it, then Re-check.</p>
-    <form method="post" action="/settings/zen-key">
-      <input name="zen_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
+    <b>One-time setup: Gemini API key</b>
+    <p class="muted">Needed so the app can spot sponsor reads when the publisher didn't mark them. Free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a>. Paste it, then Re-check. Without a key, obvious sponsor-read phrases are still cut.</p>
+    <form method="post" action="/settings/gemini-key">
+      <input name="gemini_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
       <p><button type="submit">Save key</button></p>
     </form>
   </div>

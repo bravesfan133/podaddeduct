@@ -49,27 +49,24 @@
 
   <div class="card">
     <h2>Ad detection</h2>
-    <p class="sub">Paste your OpenCode Zen API key. The app uses free chat models (big-pickle / mimo) to spot sponsor reads when the publisher didn't already mark them. {% if zen.configured %}<span class="ok">Connected ({{ zen.source }}).</span>{% else %}<span class="warn">Not connected yet.</span>{% endif %}</p>
-    {% if saved == 'zen' %}<p class="ok">Key saved.</p>{% endif %}
-    <form method="post" action="/settings/zen-key">
-      <label>Zen API key <a href="https://opencode.ai/auth" target="_blank" rel="noopener">get one</a></label>
-      <input name="zen_api_key" type="password" autocomplete="off" placeholder="{% if zen.configured %}Saved ({{ zen.hint }}) — paste to replace{% else %}Paste key…{% endif %}" />
+    <p class="sub">Paste a free <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> key. Gemini Flash spots sponsor reads in one shot when the publisher didn't already mark them. {% if gemini.configured %}<span class="ok">Connected ({{ gemini.source }}).</span>{% else %}<span class="warn">Not connected yet — heuristics still cut obvious sponsor reads.</span>{% endif %}</p>
+    {% if saved == 'gemini' %}<p class="ok">Key saved.</p>{% endif %}
+    <form method="post" action="/settings/gemini-key">
+      <label>Gemini API key</label>
+      <input name="gemini_api_key" type="password" autocomplete="off" placeholder="{% if gemini.configured %}Saved ({{ gemini.hint }}) — paste to replace{% else %}Paste key…{% endif %}" />
       <button type="submit">Save key</button>
       <button type="submit" name="clear" value="1" class="ghost">Remove</button>
-      <button type="button" id="zenTest" class="ghost">Test</button>
-      <span id="zenTestOut" class="sub" style="font-size:0.85rem"></span>
+      <button type="button" id="geminiTest" class="ghost">Test</button>
+      <span id="geminiTestOut" class="sub" style="font-size:0.85rem"></span>
     </form>
     <details class="muted" style="margin-top:0.75rem">
       <summary>Advanced (model override)</summary>
       <form method="post" action="/settings/global">
         <input type="hidden" name="settings_form" value="1" />
         <div class="row">
-          <div><label>Main model</label><input name="zen_model" type="text" list="zen-models" value="{{ global_settings.zen_model }}" placeholder="{{ effective.zen_model }}" /></div>
-          <div><label>Backup model</label><input name="zen_fallback_model" type="text" list="zen-models" value="{{ global_settings.zen_fallback_model }}" placeholder="{{ effective.zen_fallback_model }}" /></div>
+          <div><label>Gemini model</label><input name="gemini_model" type="text" value="{{ global_settings.gemini_model }}" placeholder="{{ effective.gemini_model or 'gemini-2.5-flash' }}" /></div>
         </div>
-        <datalist id="zen-models"></datalist>
-        <p class="sub" id="zen-models-note" style="font-size:0.8rem"></p>
-        <button type="submit">Save models</button>
+        <button type="submit">Save model</button>
       </form>
     </details>
   </div>
@@ -139,29 +136,13 @@
   <p class="sub" style="text-align:center;font-size:0.8rem">podaddeduct v{{ app_version }}</p>
 </main>
 <script>
-// Model list from your key (falls back to a short curated list)
-(async () => {
-  const dl = document.getElementById('zen-models'), note = document.getElementById('zen-models-note');
-  if (!dl) return;
-  try {
-    const r = await fetch('/api/zen-models');
-    const d = await r.json();
-    dl.innerHTML = '';
-    for (const m of (d.models || [])) {
-      const o = document.createElement('option');
-      o.value = m;
-      dl.appendChild(o);
-    }
-    if (note) note.textContent = d.live ? `Showing ${d.models.length} models from your key.` : 'Could not list models from the key — showing common options. You can still type any model id.';
-  } catch (e) {}
-})();
-// Test key + model without processing anything
-const zenTest = document.getElementById('zenTest');
-if (zenTest) zenTest.addEventListener('click', async () => {
-  const out = document.getElementById('zenTestOut');
+// Test Gemini key + model without processing anything
+const geminiTest = document.getElementById('geminiTest');
+if (geminiTest) geminiTest.addEventListener('click', async () => {
+  const out = document.getElementById('geminiTestOut');
   out.textContent = 'Testing…';
   try {
-    const r = await fetch('/api/zen-test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const r = await fetch('/api/gemini-test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
     const d = await r.json();
     out.textContent = d.ok ? `Works ✓ (${d.model}, ${d.ms}ms)` : `Failed: ${d.error || 'unknown error'}`;
   } catch (e) { out.textContent = 'Failed: no response'; }

@@ -68,7 +68,7 @@ def parse_chapters_tags(raw: bytes) -> dict[str, str]:
             if name == "chapters":
                 url = (child.get("url") or "").strip()
                 ctype = (child.get("type") or "").strip().lower()
-                if url and (not ctype or "json" in ctype or mime.endswith("+json")):
+                if url and (not ctype or "json" in ctype or ctype.endswith("+json")):
                     chapters_url = url
         if chapters_url:
             for k in keys:

@@ -37,12 +37,12 @@ from .feeds import (
 from .process import enqueue_episode, ensure_worker, friendly_error
 from .secrets import (
     get_app_password,
+    gemini_key_status,
     groq_key_status,
     password_source,
     set_app_password,
+    set_gemini_api_key,
     set_groq_api_key,
-    set_zen_api_key,
-    zen_key_status,
 )
 
 logger = logging.getLogger("podaddeduct")
@@ -406,10 +406,7 @@ async def settings_page(request: Request) -> HTMLResponse:
         "min_ad_seconds": db.runtime_float("min_ad_seconds", minimum=1.0, maximum=300.0),
         "silence_snap_window": db.runtime_float("silence_snap_window", minimum=0.0, maximum=10.0),
         "delete_original_after_cut": db.runtime_bool("delete_original_after_cut"),
-        "zen_model": db.runtime_str("zen_model"),
-        "zen_fallback_model": db.runtime_str("zen_fallback_model"),
-        "zen_base_url": db.runtime_str("zen_base_url"),
-        "zen_chunk_chars": db.runtime_int("zen_chunk_chars", minimum=1000),
+        "gemini_model": db.runtime_str("gemini_model"),
         "stt_python": db.runtime_str("stt_python"),
         "stt_sidecar": db.runtime_str("stt_sidecar"),
         "stt_model": db.runtime_str("stt_model"),
@@ -423,7 +420,7 @@ async def settings_page(request: Request) -> HTMLResponse:
             "storage_pct": round(100 * stats["bytes"] / max(1, stats["limit_bytes"]), 1),
             "global_settings": db.get_global_settings(),
             "effective": eff,
-            "zen": zen_key_status(),
+            "gemini": gemini_key_status(),
             "groq": groq_key_status(),
             "password_set": bool(get_app_password()),
             "password_source": password_source(),
@@ -521,18 +518,18 @@ async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
     )
 
 
-@app.post("/settings/zen-key")
-async def save_zen_key(
+@app.post("/settings/gemini-key")
+async def save_gemini_key(
     request: Request,
-    zen_api_key: str = Form(""),
+    gemini_api_key: str = Form(""),
     clear: str = Form(""),
 ) -> RedirectResponse:
     if not _authed(request):
         return RedirectResponse("/login", status_code=303)
     if clear:
-        set_zen_api_key(None)
+        set_gemini_api_key(None)
     else:
-        set_zen_api_key(zen_api_key)
+        set_gemini_api_key(gemini_api_key)
     ref = request.headers.get("referer") or "/"
     if "/episodes/" in ref:
         sep = "&" if "?" in ref else "?"
@@ -540,8 +537,8 @@ async def save_zen_key(
     from urllib.parse import urlparse as _urlparse2
 
     if _urlparse2(ref).path.startswith("/settings"):
-        return RedirectResponse("/settings?saved=zen", status_code=303)
-    return RedirectResponse("/?saved=zen", status_code=303)
+        return RedirectResponse("/settings?saved=gemini", status_code=303)
+    return RedirectResponse("/?saved=gemini", status_code=303)
 
 
 @app.post("/settings/groq-key")
@@ -559,11 +556,11 @@ async def save_groq_key(
     return RedirectResponse("/settings?saved=groq", status_code=303)
 
 
-@app.get("/api/zen-status")
-async def api_zen_status(request: Request) -> JSONResponse:
+@app.get("/api/gemini-status")
+async def api_gemini_status(request: Request) -> JSONResponse:
     if not _authed(request):
         raise HTTPException(401, "Sign in first.")
-    return JSONResponse(zen_key_status())
+    return JSONResponse(gemini_key_status())
 
 
 @app.post("/feeds")
@@ -603,12 +600,11 @@ async def save_global_settings(request: Request) -> RedirectResponse:
 
     for k in ("max_cache_gb", "keep_last_n", "delete_after_days", "poll_minutes",
               "process_recent", "feed_item_limit", "min_ad_seconds",
-              "silence_snap_window", "zen_chunk_chars"):
+              "silence_snap_window"):
         num(k, minimum=0.1 if k in {"max_cache_gb", "min_ad_seconds", "silence_snap_window"} else 1,
-            maximum=500 if k == "feed_item_limit" else (10**6 if k == "zen_chunk_chars" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50))
+            maximum=500 if k == "feed_item_limit" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50)
 
-    for k in ("zen_model", "zen_fallback_model", "zen_base_url",
-              "stt_python", "stt_sidecar", "stt_model"):
+    for k in ("gemini_model", "stt_python", "stt_sidecar", "stt_model"):
         raw = form.get(k)
         if raw not in (None, ""):
             updates[k] = str(raw).strip()
@@ -683,17 +679,8 @@ async def save_app_password(request: Request) -> RedirectResponse:
     return RedirectResponse("/settings?saved=password", status_code=303)
 
 
-@app.get("/api/zen-models")
-async def api_zen_models(request: Request) -> JSONResponse:
-    if not _authed(request):
-        raise HTTPException(401, "Sign in first.")
-    from .seed import fetch_zen_models
-
-    return JSONResponse(fetch_zen_models())
-
-
-@app.post("/api/zen-test")
-async def api_zen_test(request: Request) -> JSONResponse:
+@app.post("/api/gemini-test")
+async def api_gemini_test(request: Request) -> JSONResponse:
     if not _authed(request):
         raise HTTPException(401, "Sign in first.")
     try:
@@ -701,9 +688,9 @@ async def api_zen_test(request: Request) -> JSONResponse:
     except Exception:
         body = {}
     model = str((body or {}).get("model") or "")
-    from .seed import test_zen_connection
+    from .seed import test_gemini_connection
 
-    return JSONResponse(test_zen_connection(model or None))
+    return JSONResponse(test_gemini_connection(model or None))
 
 
 @app.get("/feeds/{slug}.xml")
@@ -870,8 +857,8 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
             "ranges_text": "\n".join(f"{r['start']}-{r['end']}" for r in ranges),
             "saved_seconds": saved,
             "public_base": public_base(request),
-            "zen": zen_key_status(),
-            "zen_model": db.runtime_str("zen_model"),
+            "gemini": gemini_key_status(),
+            "gemini_model": db.runtime_str("gemini_model"),
             "key_saved": request.query_params.get("key_saved"),
             "has_clean": db.has_clean_audio(ep),
             "has_audio": bool(db.served_audio_path(ep)),
@@ -931,7 +918,7 @@ async def save_ranges(
             raise HTTPException(400, f"End must be after start: {line}")
         parsed.append({"start": start, "end": end})
     try:
-        apply_manual_ranges(episode_id, parsed)
+        await apply_manual_ranges(episode_id, parsed)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return RedirectResponse(f"/episodes/{episode_id}", status_code=303)

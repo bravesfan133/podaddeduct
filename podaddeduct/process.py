@@ -178,12 +178,8 @@ def friendly_error(err: str | None) -> str:
         return "Transcription isn't set up — check Settings → Server."
     if "stt failed" in text or "faster_whisper" in text or "whisper" in text:
         return "Speech-to-text failed — check server logs, then hit Prepare to retry."
-    if "zen" in text and ("key" in text or "401" in text or "403" in text or "auth" in text or "api key" in text):
-        return "Ad detection needs a valid Zen API key — check Settings → Ad detection."
-    if "opencode" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
-        return "Ad detection needs a valid Zen API key — check Settings → Ad detection."
-    if "model_not_found" in text or "does not exist" in text or "session" in text:
-        return "That AI model isn't available — pick a free chat model like big-pickle in Settings."
+    if "gemini" in text and ("key" in text or "401" in text or "403" in text or "auth" in text or "api key" in text):
+        return "Ad detection needs a valid Gemini API key — check Settings → Ad detection."
     if "ffmpeg" in text:
         return "Audio cutting failed — check server logs, then hit Prepare to retry."
     if "no space" in text or "errno 28" in text or "disk" in text:
@@ -420,15 +416,24 @@ def _finalize(
         logger.exception("janitor failed")
 
 
-def apply_manual_ranges(episode_id: int, ad_dicts: list[dict[str, float]]) -> db.Episode:
+async def apply_manual_ranges(episode_id: int, ad_dicts: list[dict[str, float]]) -> db.Episode:
+    """Save hand-edited ad marks and re-cut. Re-downloads original if it was evicted."""
     from .chapters import dicts_to_intervals, intervals_to_dicts
 
     ep = db.get_episode(episode_id)
     if not ep:
         raise ValueError("Episode not found")
-    audio_path = Path(ep.audio_path) if ep.audio_path else None
-    if not audio_path or not audio_path.exists():
-        raise ValueError("Episode file isn't downloaded yet — press Re-check first, then edit marks.")
+    audio_path = Path(ep.audio_path) if ep.audio_path else audio_path_for(episode_id)
+    if audio_path.exists() and not complete_marker_for(audio_path).exists():
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not audio_path.exists():
+        logger.info("episode %s: re-downloading original for manual cut", episode_id)
+        audio_path = await download_file(ep.enclosure_url, audio_path_for(episode_id))
+        db.update_episode(episode_id, audio_path=str(audio_path))
+
     pcm, sr = load_mono_pcm(audio_path)
     duration = len(pcm) / float(sr)
     ads = dicts_to_intervals(ad_dicts)
@@ -447,12 +452,23 @@ def apply_manual_ranges(episode_id: int, ad_dicts: list[dict[str, float]]) -> db
             clean_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    # Match the normal pipeline: drop the big original once a clean file exists.
+    kept_audio: str | None = str(audio_path)
+    if clean_audio_path and db.runtime_bool("delete_original_after_cut"):
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+            complete_marker_for(Path(audio_path)).unlink(missing_ok=True)
+            kept_audio = None
+        except OSError:
+            pass
+
     db.set_ad_ranges(episode_id, intervals_to_dicts(ads), status="manual")
-    size = _file_size(Path(clean_audio_path) if clean_audio_path else audio_path)
+    size = _file_size(Path(clean_audio_path) if clean_audio_path else (Path(kept_audio) if kept_audio else None))
     ep = db.update_episode(
         episode_id,
         duration_seconds=duration,
-        audio_path=str(audio_path),
+        audio_path=kept_audio,
         clean_audio_path=clean_audio_path,
         size_bytes=size,
         error=cut_error,

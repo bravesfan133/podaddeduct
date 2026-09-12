@@ -12,7 +12,7 @@ cp -n .env.example .env 2>/dev/null || true
 
 Open `http://127.0.0.1:8080/`:
 
-1. **Paste your OpenCode Zen API key** once in Settings (gear icon) — free chat models spot ads when needed.
+1. **Paste a free Gemini API key** once in Settings (gear icon) — get one at [Google AI Studio](https://aistudio.google.com/apikey). Gemini Flash spots ads in one shot when needed.
 2. **Search** for a show by name, press Add.
 3. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
 4. **Play.** New episodes prepare automatically; first play waits until the clean file is ready (never streams the with-ads original). Afterwards it's instant.
@@ -35,14 +35,16 @@ Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
 2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
-3. Cheap **sponsor-read heuristics**, then **OpenCode Zen** chat/completions (`big-pickle` / `mimo-v2.5-free`) on leftover spans only.
-4. Snap to silence, cut with ffmpeg.
+3. Cheap **sponsor-read heuristics**, then **Google Gemini Direct** (`gemini-2.5-flash`, free AI Studio tier) on leftover spans in one shot.
+4. Snap to silence, cut with ffmpeg (ID3 tags and cover art preserved).
 
 Everything is configured in **Settings** — no config files needed:
 
-- **Ad detection:** paste the Zen API key once, Test button proves it works. Model overrides are under Advanced.
+- **Ad detection:** paste the Gemini API key once, Test button proves it works. Model override is under Advanced.
 - **Server:** transcription backend (Mac Parakeet / Linux faster-whisper / optional Groq Whisper), Groq key for cloud STT only, public address for Overcast, family password.
 - **Processing:** how many episodes to prepare, shortest ad to cut.
+
+Without a Gemini key, obvious sponsor-read phrases ("sponsored by", promo codes, etc.) are still cut via heuristics.
 
 ## Home server (Docker)
 

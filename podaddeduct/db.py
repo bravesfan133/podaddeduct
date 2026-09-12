@@ -583,11 +583,8 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (OpenCode Zen chat/completions)
-    "zen_model": "",
-    "zen_fallback_model": "",
-    "zen_base_url": "",
-    "zen_chunk_chars": "",
+    # Ad detection (Google Gemini Direct Free API)
+    "gemini_model": "",
     # Transcription backend
     "stt_python": "",
     "stt_sidecar": "",
@@ -607,10 +604,7 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "silence_snap_window": "silence_snap_window",
     "delete_original_after_cut": "delete_original_after_cut",
     "auto_prepare_latest": "auto_prepare_latest",
-    "zen_model": "zen_model",
-    "zen_fallback_model": "zen_fallback_model",
-    "zen_base_url": "zen_base_url",
-    "zen_chunk_chars": "zen_chunk_chars",
+    "gemini_model": "gemini_model",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",
     "stt_model": "stt_model",
@@ -704,13 +698,9 @@ def runtime_bool(key: str) -> bool:
 
 
 def models_to_try() -> list[str]:
-    """Effective (primary, fallback) Zen models: UI wins over env/default."""
-    ordered: list[str] = []
-    for key in ("zen_model", "zen_fallback_model"):
-        mid = runtime_str(key).strip()
-        if mid and mid not in ordered:
-            ordered.append(mid)
-    return ordered
+    """Effective Gemini model list (single primary for now)."""
+    mid = runtime_str("gemini_model").strip()
+    return [mid] if mid else []
 
 
 # --- Storage ---

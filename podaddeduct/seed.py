@@ -4,29 +4,22 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 
 import httpx
 import numpy as np
 
 from .config import settings
 from .intervals import Interval, merge_intervals
-from .stt import chunk_transcript_lines
+from .stt import format_timestamped_transcript
 
 logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-# Chat/completions free models on Zen — not Responses-only Muse Spark.
-CURATED_ZEN_MODELS = [
-    "big-pickle",
-    "mimo-v2.5-free",
-    "nemotron-3.5-lightning-free",
-    "ling-3.0-flash-fin-free",
-]
-
-CHAT_MAX_TRIES = 4
-CHAT_MAX_TOKENS = 400
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MAX_TRIES = 3
+GEMINI_MAX_OUTPUT_TOKENS = 2048
 
 # Obvious sponsor-read cues. Contiguous hits become heuristic ad ranges.
 _HEURISTIC_RE = re.compile(
@@ -51,31 +44,6 @@ _HEURISTIC_RE = re.compile(
     r")\b"
 )
 
-
-def resolve_zen_api_key() -> str | None:
-    """Prefer UI-saved key, then env, then OpenCode auth.json."""
-    from .secrets import get_zen_api_key
-
-    stored = get_zen_api_key()
-    if stored:
-        return stored
-    key = (settings.zen_api_key or "").strip()
-    if key:
-        return key
-    auth_path = Path(settings.zen_auth_path).expanduser()
-    if not auth_path.exists():
-        return None
-    try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    for provider in ("opencode", "opencode-go"):
-        entry = data.get(provider)
-        if isinstance(entry, dict) and entry.get("key"):
-            return str(entry["key"]).strip()
-    return None
-
-
 SYSTEM_PROMPT = """You mark podcast advertisements for cutting.
 Given a timestamped transcript ([start-end] text per line), return ONLY a JSON array of
 objects {"start": <seconds>, "end": <seconds>} for every ad segment:
@@ -86,6 +54,19 @@ objects {"start": <seconds>, "end": <seconds>} for every ad segment:
 Do NOT mark show content, banter about the topic, or brief brand mentions that are not ads.
 Merge contiguous ad sentences into one range. Use the transcript timestamps.
 Return [] if there are no ads. No markdown, no commentary — JSON array only."""
+
+
+def resolve_gemini_api_key() -> str | None:
+    """Prefer UI-saved key, then GEMINI_API_KEY / GOOGLE_API_KEY env."""
+    from .secrets import get_gemini_api_key
+
+    return get_gemini_api_key()
+
+
+def gemini_model() -> str:
+    from . import db
+
+    return (db.runtime_str("gemini_model") or settings.gemini_model or GEMINI_DEFAULT_MODEL).strip()
 
 
 def _extract_json_array(text: str) -> list[dict]:
@@ -117,49 +98,25 @@ def _extract_json_array(text: str) -> list[dict]:
     return out
 
 
-def ad_models_to_try() -> list[str]:
-    """Primary + fallback Zen chat models."""
-    from . import db
-
-    ordered: list[str] = []
-    for key in ("zen_model", "zen_fallback_model"):
-        mid = db.runtime_str(key).strip()
-        if mid and mid not in ordered:
-            # Skip Responses-only Muse Spark — that path is gone.
-            if "muse-spark" in mid and "contributor" in mid:
-                logger.warning("Ignoring Responses-only model %s; using chat free models", mid)
-                continue
-            ordered.append(mid)
-    if not ordered:
-        ordered = list(CURATED_ZEN_MODELS[:2])
-    return ordered
-
-
-def _zen_base_url() -> str:
-    from . import db
-
-    return (db.runtime_str("zen_base_url") or settings.zen_base_url).rstrip("/")
-
-
-def _chat_completions(api_key: str, model: str, user_content: str) -> str:
-    """Single OpenAI-compatible chat/completions call with retries."""
-    url = _zen_base_url() + "/chat/completions"
+def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
+    """One-shot Gemini generateContent call with retries on transient errors."""
+    url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
     payload = {
-        "model": model,
-        "temperature": 0.1,
-        "max_tokens": CHAT_MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+            "responseMimeType": "application/json",
+        },
     }
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
     }
     last_err = ""
-    with httpx.Client(timeout=180.0) as client:
-        for attempt in range(1, CHAT_MAX_TRIES + 1):
+    with httpx.Client(timeout=120.0) as client:
+        for attempt in range(1, GEMINI_MAX_TRIES + 1):
             try:
                 resp = client.post(url, headers=headers, json=payload)
             except httpx.HTTPError as exc:
@@ -168,87 +125,48 @@ def _chat_completions(api_key: str, model: str, user_content: str) -> str:
             else:
                 if resp.status_code < 400:
                     data = resp.json() if isinstance(resp.json(), dict) else {}
-                    choices = data.get("choices") or []
-                    if not choices:
-                        raise RuntimeError("Zen returned no choices")
-                    msg = choices[0].get("message") or {}
-                    return str(msg.get("content") or "")
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        raise RuntimeError("Gemini returned no candidates")
+                    content = (candidates[0].get("content") or {})
+                    parts = content.get("parts") or []
+                    texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict)]
+                    return "\n".join(t for t in texts if t).strip()
                 last_err = f"{resp.status_code} {resp.text[:300]}"
-                body = resp.text[:500]
-                if "MissingSessionID" in body or "only be used in OpenCode" in body:
-                    raise RuntimeError(
-                        f"Model {model} needs an OpenCode session (not a headless API). "
-                        "Pick a chat/completions free model like big-pickle or mimo-v2.5-free "
-                        "in Settings → Ad detection."
-                    )
                 if resp.status_code not in (408, 425, 429, 500, 502, 503, 504):
                     raise httpx.HTTPStatusError(
                         last_err, request=resp.request, response=resp
                     )
-            if attempt < CHAT_MAX_TRIES:
-                wait = 5 * 2 ** (attempt - 1)
+            if attempt < GEMINI_MAX_TRIES:
+                wait = 2 * 2 ** (attempt - 1)
                 try:
                     if resp is not None:
-                        wait = min(120.0, float(resp.headers.get("retry-after", "") or wait))
+                        wait = min(60.0, float(resp.headers.get("retry-after", "") or wait))
                 except (TypeError, ValueError):
                     pass
-                logger.warning("Zen chat attempt %d failed, retry in %.0fs: %s", attempt, wait, last_err)
+                logger.warning("Gemini attempt %d failed, retry in %.0fs: %s", attempt, wait, last_err)
                 time.sleep(wait)
-    raise RuntimeError(f"Zen chat failed after {CHAT_MAX_TRIES} tries: {last_err}")
+    raise RuntimeError(f"Gemini failed after {GEMINI_MAX_TRIES} tries: {last_err}")
 
 
-def _live_model_ids(base: str, api_key: str, *, path: str = "/models") -> list[str] | None:
-    """Fetch model ids from an OpenAI-style /models endpoint. None on failure."""
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.get(
-                base.rstrip("/") + path,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        ids: list[str] = []
-        items = data.get("data") if isinstance(data, dict) else None
-        if isinstance(items, list):
-            for item in items:
-                mid = item.get("id") if isinstance(item, dict) else None
-                if mid and mid not in ids:
-                    ids.append(str(mid))
-        return sorted(ids)[:200] or None
-    except Exception as exc:
-        logger.warning("Live /models failed for %s, using curated list: %s", base, exc)
-        return None
-
-
-def fetch_zen_models() -> dict:
-    """List Zen model ids. Falls back to curated free chat models."""
-    api_key = resolve_zen_api_key()
-    base = _zen_base_url()
-    if not api_key or not base:
-        return {"models": list(CURATED_ZEN_MODELS), "live": False}
-    ids = _live_model_ids(base, api_key)
-    if not ids:
-        return {"models": list(CURATED_ZEN_MODELS), "live": False}
-    # Prefer free/chat models first in the datalist.
-    preferred = [m for m in CURATED_ZEN_MODELS if m in ids]
-    rest = [m for m in ids if m not in preferred]
-    return {"models": preferred + rest, "live": True}
-
-
-def test_zen_connection(model: str | None = None) -> dict:
+def test_gemini_connection(model: str | None = None) -> dict:
     """Send one tiny request to prove key + model work. Never raises."""
     try:
-        api_key = resolve_zen_api_key()
+        api_key = resolve_gemini_api_key()
         if not api_key:
-            return {"ok": False, "error": "No API key saved yet."}
-        use_model = (model or "").strip() or (ad_models_to_try() or [""])[0]
-        if not use_model:
-            return {"ok": False, "error": "No model selected."}
+            return {"ok": False, "error": "No Gemini API key saved yet."}
+        use_model = (model or "").strip() or gemini_model()
         start = time.monotonic()
-        raw = _chat_completions(api_key, use_model, "Return exactly: []")
+        raw = _gemini_generate(api_key, use_model, "Return exactly: []")
         parsed = _extract_json_array(raw)
         ms = int((time.monotonic() - start) * 1000)
-        return {"ok": True, "provider": "zen", "model": use_model, "ms": ms, "ranges": len(parsed)}
+        return {
+            "ok": True,
+            "provider": "gemini",
+            "model": use_model,
+            "ms": ms,
+            "ranges": len(parsed),
+        }
     except Exception as exc:
         logger.warning("Ad-detection test failed: %s", exc)
         return {"ok": False, "error": str(exc)[-300:]}
@@ -273,7 +191,6 @@ def heuristic_ads(transcript: dict) -> list[Interval]:
             continue
         if end > start:
             hits.append(Interval(start, end))
-    # Merge near-contiguous hits (host-read blocks span several sentences).
     return merge_intervals(hits, gap=8.0)
 
 
@@ -282,7 +199,6 @@ def _sentence_overlaps(start: float, end: float, covered: list[Interval]) -> boo
     for c in covered:
         if c.start <= mid <= c.end:
             return True
-        # Also treat mostly-overlapping sentences as covered.
         overlap = min(end, c.end) - max(start, c.start)
         if overlap > 0 and overlap >= 0.5 * (end - start):
             return True
@@ -311,71 +227,50 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
     return out
 
 
-def find_ads_with_llm(transcript: dict, progress_cb=None) -> list[Interval]:
-    """Run leftover transcript chunks through Zen chat/completions."""
-    from . import db
-
-    api_key = resolve_zen_api_key()
+def find_ads_with_gemini(transcript: dict, progress_cb=None) -> list[Interval]:
+    """One-shot Gemini call on the full leftover transcript. Empty list on soft failure."""
+    api_key = resolve_gemini_api_key()
     if not api_key:
-        raise RuntimeError(
-            "No OpenCode Zen API key. Paste one in Settings → Ad detection "
-            "(or set ZEN_API_KEY / OPENCODE_API_KEY). Get a key at https://opencode.ai/auth — "
-            "use a free chat model like big-pickle or mimo-v2.5-free."
-        )
-
-    chunks = chunk_transcript_lines(
-        transcript, max_chars=db.runtime_int("zen_chunk_chars", minimum=1000)
-    )
-    if not chunks:
+        logger.info("No Gemini API key; skipping LLM ad detection")
         return []
 
-    models = ad_models_to_try()
-    if not models:
-        raise RuntimeError("No Zen model selected. Pick one in Settings → Ad detection.")
+    body = format_timestamped_transcript(transcript)
+    if not body.strip():
+        return []
 
-    all_ranges: list[Interval] = []
-    for i, chunk in enumerate(chunks):
-        user = (
-            f"Transcript chunk {i + 1}/{len(chunks)}. "
-            "Return JSON array of ad ranges for THIS chunk only.\n\n"
-            f"{chunk}"
-        )
-        parsed: list[dict] | None = None
-        last_err: Exception | None = None
-        raw = ""
-        for model in models:
-            try:
-                raw = _chat_completions(api_key, model, user)
-                parsed = _extract_json_array(raw)
-                logger.info("zen %s chunk %s/%s -> %d ranges", model, i + 1, len(chunks), len(parsed))
-                break
-            except Exception as exc:
-                last_err = exc
-                logger.warning(
-                    "zen model %s failed on chunk %s: %s; raw=%r",
-                    model,
-                    i + 1,
-                    exc,
-                    (raw or "")[:500],
-                )
-        if parsed is None:
-            raise RuntimeError(f"Ad detection failed on chunk {i + 1}: {last_err}")
-        for r in parsed:
-            all_ranges.append(Interval(float(r["start"]), float(r["end"])))
+    model = gemini_model()
+    user = (
+        "Return JSON array of ad ranges for this transcript.\n\n"
+        f"{body}"
+    )
+    if progress_cb is not None:
+        progress_cb(0, 1)
+    try:
+        raw = _gemini_generate(api_key, model, user)
+        parsed = _extract_json_array(raw)
+        logger.info("gemini %s -> %d ranges", model, len(parsed))
+    except Exception as exc:
+        # Soft failure: heuristics still apply; never abort the episode.
+        logger.warning("Gemini ad detection failed (using heuristics only): %s", exc)
         if progress_cb is not None:
-            progress_cb(i + 1, len(chunks))
-
-    return merge_intervals(all_ranges, gap=2.0)
+            progress_cb(1, 1)
+        return []
+    if progress_cb is not None:
+        progress_cb(1, 1)
+    return merge_intervals(
+        [Interval(float(r["start"]), float(r["end"])) for r in parsed],
+        gap=2.0,
+    )
 
 
 def find_ads_with_zen(transcript: dict, progress_cb=None) -> list[Interval]:
-    """Heuristics first, then LLM on leftover spans. Name kept for call sites."""
+    """Heuristics first, then Gemini on leftovers. Name kept for call sites."""
     heur = heuristic_ads(transcript)
     leftover = leftover_transcript(transcript, heur)
     if not (leftover.get("sentences") or []):
         logger.info("heuristic ads covered the transcript (%d ranges); skipping LLM", len(heur))
         return heur
-    llm = find_ads_with_llm(leftover, progress_cb=progress_cb)
+    llm = find_ads_with_gemini(leftover, progress_cb=progress_cb)
     return union_ranges(heur, llm)
 
 
@@ -410,6 +305,17 @@ def snap_to_silence(
             return t
         idx = np.where(mask)[0]
         local = rms[idx]
+        # Prefer valleys before the start / after the end so we don't cut mid-word.
+        if prefer == "before":
+            before = idx[times[idx] <= t]
+            if len(before):
+                local_b = rms[before]
+                return float(times[before[int(np.argmin(local_b))]])
+        elif prefer == "after":
+            after = idx[times[idx] >= t]
+            if len(after):
+                local_a = rms[after]
+                return float(times[after[int(np.argmin(local_a))]])
         best_local = int(np.argmin(local))
         return float(times[idx[best_local]])
 
@@ -437,5 +343,5 @@ def union_ranges(*groups: list[Interval]) -> list[Interval]:
 def filter_min_duration(ranges: list[Interval], min_seconds: float | None = None) -> list[Interval]:
     from . import db as _db
 
-    floor = _db.runtime_float("min_ad_seconds", minimum=1.0) if min_seconds is None else min_seconds
+    floor = min_seconds if min_seconds is not None else _db.runtime_float("min_ad_seconds", minimum=1.0)
     return [r for r in ranges if r.duration >= floor]

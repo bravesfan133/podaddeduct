@@ -41,7 +41,7 @@ def test_friendly_error_mapping():
 
     assert friendly_error(None) == ""
     assert "Settings → Server" in friendly_error("RuntimeError: Transcription tool not found at x")
-    assert "API key" in friendly_error("zen 401 unauthorized key invalid")
+    assert "API key" in friendly_error("gemini 401 unauthorized key invalid")
     assert "disk" in friendly_error("OSError: [Errno 28] No space left on device").lower()
     assert "download" in friendly_error("ConnectTimeout while fetching enclosure").lower()
     assert friendly_error("Something totally novel exploded") != ""

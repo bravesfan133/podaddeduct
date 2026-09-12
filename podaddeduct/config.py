@@ -49,29 +49,16 @@ class Settings(BaseSettings):
     # Optional shared password when exposed via tunnel (empty = no login locally).
     app_password: str = ""
 
-    # Local Parakeet (Mac) / faster-whisper (Linux) + OpenCode Zen chat for ads.
+    # Local Parakeet (Mac) / faster-whisper (Linux) + Google Gemini Direct for ads.
     stt_python: str = "./.venv-stt/bin/python"
     stt_sidecar: str = "./scripts/stt_sidecar.py"
     stt_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
-    zen_api_key: str | None = Field(
+    gemini_api_key: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("ZEN_API_KEY", "OPENCODE_API_KEY", "zen_api_key"),
+        validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
     )
-    zen_base_url: str = "https://opencode.ai/zen/v1"
-    # Free chat/completions models (not Responses-only Muse Spark).
-    zen_model: str = "big-pickle"
-    zen_fallback_model: str = "mimo-v2.5-free"
-    zen_auth_path: str = "~/.local/share/opencode/auth.json"
-    zen_chunk_chars: int = 8000
+    gemini_model: str = "gemini-2.5-flash"
     silence_snap_window: float = 1.5
-
-    def zen_models_to_try(self) -> list[str]:
-        ordered: list[str] = []
-        for mid in [self.zen_model, self.zen_fallback_model]:
-            mid = mid.strip()
-            if mid and mid not in ordered:
-                ordered.append(mid)
-        return ordered
 
     @property
     def audio_dir(self) -> Path:

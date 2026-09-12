@@ -62,11 +62,17 @@ def test_parse_chapters_tags():
         <guid>ep-2</guid>
         <enclosure url="https://cdn.example/b.mp3" />
       </item>
+      <item>
+        <guid>ep-3</guid>
+        <enclosure url="https://cdn.example/c.mp3" />
+        <podcast:chapters url="https://cdn.example/c.psc" type="application/x-psc" />
+      </item>
     </channel></rss>"""
     m = parse_chapters_tags(raw)
     assert m["ep-1"] == "https://cdn.example/a.json"
     assert m["https://cdn.example/a.mp3"] == "https://cdn.example/a.json"
     assert "ep-2" not in m
+    assert "ep-3" not in m  # non-JSON chapter type ignored (no NameError)
 
 
 def test_try_publisher_chapters_returns_ads():
