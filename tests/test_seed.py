@@ -101,7 +101,8 @@ def test_find_ads_with_gemini_mocked():
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
-        ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
+        result = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
+    ads = result.ranges
     # Full transcript (including heuristic-covered sponsor lines) goes to Gemini.
     assert seen_bodies and "brought to you" in seen_bodies[0]
     assert "Midroll" in seen_bodies[0]
@@ -109,6 +110,7 @@ def test_find_ads_with_gemini_mocked():
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
+    assert result.gemini_ok
 
 
 def test_pad_and_clamp_ads_pre_and_postroll():
@@ -148,6 +150,19 @@ def test_heuristic_ads_finds_sports_cues():
     assert ads[0].end >= 24.0  # merged across the FanDuel + helpline block
 
 
+def test_filter_rejects_micro_cuts():
+    from podaddeduct.seed import MIN_AD_CUT_SECONDS, filter_min_duration
+
+    ranges = [
+        Interval(0.0, 6.0),
+        Interval(100.0, 104.0),
+        Interval(200.0, 260.0),
+    ]
+    kept = filter_min_duration(ranges, min_seconds=MIN_AD_CUT_SECONDS)
+    assert len(kept) == 1
+    assert kept[0].start == 200.0
+
+
 def test_find_ads_progress_callback():
     from podaddeduct import seed as seed_mod
 
@@ -171,7 +186,7 @@ def test_find_ads_progress_callback():
     ):
         seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
-    assert seen[-1] == (1, 1)
+    assert seen[-1][0] == seen[-1][1]
 
 
 def test_default_gemini_model():

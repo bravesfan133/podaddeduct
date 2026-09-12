@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     public_base_url: str = ""
     process_recent: int = 2
     feed_item_limit: int = 300
-    min_ad_seconds: float = 8.0
+    min_ad_seconds: float = 15.0
     data_dir: Path = Path("./data")
     host: str = "0.0.0.0"
     port: int = 8080

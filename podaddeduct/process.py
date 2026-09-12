@@ -14,7 +14,7 @@ from .cut import clean_path_for, cut_ads
 from .decode import load_mono_pcm
 from .download import complete_marker_for, download_file
 from .intervals import Interval
-from .seed import filter_min_duration, find_ads_with_zen, snap_to_silence
+from .seed import effective_min_ad_seconds, filter_min_duration, find_ads_with_zen, snap_to_silence
 from .stt import transcribe_audio, transcript_path_for
 
 logger = logging.getLogger("podaddeduct.process")
@@ -356,7 +356,7 @@ async def process_episode(episode_id: int) -> None:
             db.update_episode(episode_id, status="ready", error=None)
         return
     # Manual marks with evicted files: fall through to re-cut from saved
-    # marks below instead of returning early (would 503 forever).
+    # marks below instead of returning early (would redirect forever).
 
     db.update_episode(episode_id, status="working", error=None)
     audio_path = Path(ep.audio_path) if ep.audio_path else audio_path_for(episode_id)
@@ -436,7 +436,7 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     pub_ads = try_publisher_chapters(ep, duration) if ep is not None else None
     if pub_ads:
         ads = snap_to_silence(pub_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
-        ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
+        ads = filter_min_duration(ads, min_seconds=effective_min_ad_seconds())
         _finalize(episode_id, audio_path, duration, ads)
         logger.info(
             "episode %s done via publisher chapters (%d ads, total %.0fs)",
@@ -470,12 +470,32 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     db.update_episode(episode_id, status="working", error="Finding ads…")
     _job_stage("detecting")
     t0 = time.monotonic()
-    detected = find_ads_with_zen(transcript, progress_cb=_job_progress)
-    logger.info("episode %s ad detection found %d ranges in %.0fs", episode_id, len(detected), time.monotonic() - t0)
+    detection = find_ads_with_zen(transcript, progress_cb=_job_progress)
+    detected = detection.ranges
+    logger.info(
+        "episode %s ad detection found %d ranges in %.0fs (gemini_ok=%s)",
+        episode_id,
+        len(detected),
+        time.monotonic() - t0,
+        detection.gemini_ok,
+    )
     ads = snap_to_silence(detected, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
-    ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
+    ads = filter_min_duration(ads, min_seconds=effective_min_ad_seconds())
 
-    _finalize(episode_id, audio_path, duration, ads)
+    warn = None
+    if detection.gemini_error and not detection.gemini_ok:
+        warn = (
+            "AI ad detection failed — only obvious sponsor phrases were used. "
+            "Press Re-check after fixing your Gemini key / rate limit. "
+            f"({detection.gemini_error[:180]})"
+        )
+    elif detection.gemini_error:
+        warn = (
+            "AI ad detection had partial failures on some transcript chunks. "
+            f"Re-check if ads remain. ({detection.gemini_error[:180]})"
+        )
+
+    _finalize(episode_id, audio_path, duration, ads, warning=warn)
     logger.info("episode %s done with %d ad ranges (total %.0fs)", episode_id, len(ads), time.monotonic() - t_all)
 
 
@@ -484,6 +504,8 @@ def _finalize(
     audio_path: Path,
     duration: float,
     ads: list[Interval],
+    *,
+    warning: str | None = None,
 ) -> None:
     from .chapters import intervals_to_dicts
 
@@ -494,7 +516,7 @@ def _finalize(
         "duration_seconds": duration,
         "ad_ranges_json": json.dumps(ad_dicts),
         "status": "ready",
-        "error": None,
+        "error": (warning[:1500] if warning else None),
     }
 
     clean_path = clean_path_for(episode_id)

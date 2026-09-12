@@ -70,8 +70,25 @@ def test_gemini_generate_success(tmp_path, monkeypatch):
     url, kwargs = fake.posts[0]
     assert "gemini-3.6-flash:generateContent" in url
     assert kwargs["headers"]["x-goog-api-key"] == "k"
-    assert kwargs["json"]["generationConfig"]["responseMimeType"] == "application/json"
-    assert kwargs["json"]["generationConfig"]["maxOutputTokens"] == 8192
+    gen = kwargs["json"]["generationConfig"]
+    assert gen["responseMimeType"] == "application/json"
+    assert gen["maxOutputTokens"] == 8192
+    assert gen["temperature"] == 1.0
+    assert gen["thinkingConfig"] == {"thinkingBudget": 0}
+    assert gen["responseSchema"]["type"] == "ARRAY"
+    assert "start" in gen["responseSchema"]["items"]["properties"]
+
+
+def test_gemini_2x_payload_omits_thinking(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    fake = _FakeClient([_ok_gemini("[]")])
+    with patch.object(seed_mod.httpx, "Client", return_value=fake):
+        seed_mod._gemini_generate("k", "gemini-2.5-flash", "hi")
+    gen = fake.posts[0][1]["json"]["generationConfig"]
+    assert "thinkingConfig" not in gen
+    assert gen["responseSchema"]["type"] == "ARRAY"
 
 
 def test_gemini_generate_filters_thinking_parts(tmp_path, monkeypatch):
@@ -152,8 +169,8 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     from podaddeduct import seed as seed_mod
 
     assert seed_mod.gemini_model() == "gemini-3.6-flash"
-    db.set_global_settings({"gemini_model": "gemini-2.0-flash"})
-    assert seed_mod.gemini_model() == "gemini-2.0-flash"
+    db.set_global_settings({"gemini_model": "gemini-2.5-flash"})
+    assert seed_mod.gemini_model() == "gemini-2.5-flash"
 
 
 def test_gemini_503_falls_back_to_flash(tmp_path, monkeypatch):
@@ -178,10 +195,11 @@ def test_gemini_503_falls_back_to_flash(tmp_path, monkeypatch):
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
-        ads = seed_mod.find_ads_with_gemini(transcript)
-    assert len(ads) == 1
+        result = seed_mod.find_ads_with_gemini(transcript)
+    assert result.gemini_ok
+    assert len(result.ranges) == 1
     assert calls == [seed_mod.GEMINI_DEFAULT_MODEL, seed_mod.GEMINI_FALLBACK_MODEL]
-    assert ads[0].start == 10.0
+    assert result.ranges[0].start == 10.0
 
 
 def test_find_ads_uses_gemini(tmp_path, monkeypatch):
@@ -201,8 +219,9 @@ def test_find_ads_uses_gemini(tmp_path, monkeypatch):
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
-        ads = seed_mod.find_ads_with_zen(transcript)
-    assert len(ads) == 1
+        result = seed_mod.find_ads_with_zen(transcript)
+    assert len(result.ranges) == 1
+    assert result.gemini_ok
     assert calls and calls[0] == "gemini-3.6-flash"
 
 
@@ -217,9 +236,11 @@ def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
         ]
     }
     with patch.object(seed_mod, "resolve_gemini_api_key", return_value=None):
-        ads = seed_mod.find_ads_with_zen(transcript)
-    assert len(ads) >= 1
-    assert ads[0].start <= 4.5
+        result = seed_mod.find_ads_with_zen(transcript)
+    assert len(result.ranges) >= 1
+    assert result.ranges[0].start <= 4.5
+    assert result.gemini_ok is False
+    assert result.gemini_error is None
 
 
 def test_find_ads_gemini_soft_fails_to_heuristics(tmp_path, monkeypatch):
@@ -240,8 +261,90 @@ def test_find_ads_gemini_soft_fails_to_heuristics(tmp_path, monkeypatch):
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=boom),
     ):
-        ads = seed_mod.find_ads_with_zen(transcript)
-    assert len(ads) >= 1  # heuristics still applied; never raises
+        result = seed_mod.find_ads_with_zen(transcript)
+    assert len(result.ranges) >= 1  # heuristics still applied; never raises
+    assert result.gemini_ok is False
+    assert result.gemini_error and "network down" in result.gemini_error
+
+
+def test_micro_cuts_filtered_when_gemini_fails(tmp_path, monkeypatch):
+    """Isolated 4–7s keyword sentences must not become 'ads removed'."""
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    transcript = {
+        "sentences": [
+            {"text": "Welcome to Talkin Baseball.", "start": 0.0, "end": 5.0},
+            {"text": "Let's take a quick break.", "start": 67.0, "end": 73.0},
+            {"text": "Show content resumes here for a while.", "start": 73.0, "end": 500.0},
+            {"text": "Use code FOO at checkout.", "start": 525.0, "end": 529.0},
+            {"text": "More baseball talk.", "start": 529.0, "end": 1400.0},
+            {"text": "Visit example.com for details.", "start": 1436.0, "end": 1441.0},
+            {"text": "Back to the show again.", "start": 1441.0, "end": 4900.0},
+            {"text": "Call 1-800-GAMBLER if you have a gambling problem.", "start": 4909.0, "end": 4916.0},
+            {"text": "Thanks for listening.", "start": 4916.0, "end": 4920.0},
+        ]
+    }
+
+    def boom(*a, **k):
+        raise RuntimeError("429 rate limited")
+
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=boom),
+    ):
+        result = seed_mod.find_ads_with_zen(transcript)
+    assert result.gemini_ok is False
+    assert result.gemini_error
+    assert all(r.duration >= seed_mod.MIN_AD_CUT_SECONDS for r in result.ranges)
+    # Four isolated cue sentences must not survive as micro-cuts.
+    assert not any(r.duration < 15 for r in result.ranges)
+
+
+def test_chunked_gemini_merges_across_long_transcript(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    import json
+
+    from podaddeduct import seed as seed_mod
+
+    # Build a long transcript that forces multiple chunks.
+    sentences = []
+    t = 0.0
+    for i in range(200):
+        text = f"Baseball content sentence number {i} with enough filler words to grow."
+        sentences.append({"text": text, "start": t, "end": t + 8.0})
+        t += 8.0
+    # Ad early and late so they land in different chunks.
+    sentences[5] = {"text": "This midroll is a car commercial pitch.", "start": 40.0, "end": 100.0}
+    sentences[150] = {"text": "Post show sponsor read continues here.", "start": 1200.0, "end": 1280.0}
+    transcript = {"sentences": sentences}
+
+    bodies = []
+
+    def fake_gemini(api_key, model, user_content):
+        bodies.append(user_content)
+        out = []
+        if "car commercial" in user_content:
+            out.append({"start": 40.0, "end": 100.0})
+        if "sponsor read" in user_content:
+            out.append({"start": 1200.0, "end": 1280.0})
+        return json.dumps(out)
+
+    seen_progress = []
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
+        patch.object(seed_mod, "GEMINI_CHUNK_MAX_CHARS", 800),
+    ):
+        result = seed_mod.find_ads_with_gemini(
+            transcript, progress_cb=lambda d, tot: seen_progress.append((d, tot))
+        )
+    assert result.gemini_ok
+    assert len(bodies) >= 2, "expected multiple Gemini chunks"
+    assert len(result.ranges) == 2
+    assert result.ranges[0].start == 40.0
+    assert result.ranges[1].end == 1280.0
+    assert seen_progress and seen_progress[-1][0] == seen_progress[-1][1]
 
 
 def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):

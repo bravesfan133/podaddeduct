@@ -40,6 +40,14 @@
     <pre class="err" style="white-space:pre-wrap;font-size:0.8rem">{{ episode.error }}</pre>
   </details>
   {% endif %}
+  {% elif episode.error and episode.status in ('ready', 'manual') %}
+  <div class="player" style="border-color:var(--warn, #c90)">
+    <b>Ad detection warning</b>
+    <p class="muted" style="margin:0.35rem 0 0">{{ episode.error }}</p>
+    <form method="post" action="/episodes/{{ episode.id }}/recheck" style="margin-top:0.75rem">
+      <button type="submit">Re-check with Gemini</button>
+    </form>
+  </div>
   {% endif %}
   {% if key_saved %}<p class="muted ok">Key saved — press Re-check.</p>{% endif %}
 

@@ -4,23 +4,26 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 
 import httpx
 import numpy as np
 
 from .config import settings
 from .intervals import Interval, merge_intervals
-from .stt import format_timestamped_transcript
+from .stt import chunk_transcript_lines
 
 logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
 GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
-GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MAX_TRIES = 5
 GEMINI_MAX_OUTPUT_TOKENS = 8192
+# ~15 min of dense transcript text per chunk; overlapping windows for long shows.
+GEMINI_CHUNK_MAX_CHARS = 12000
 
 # MinusPod-style boundary defaults.
 EARLY_AD_SNAP_SECONDS = 30.0
@@ -30,6 +33,29 @@ AD_PAD_END_SECONDS = 0.6
 NEARBY_AD_GAP_SECONDS = 15.0
 HEURISTIC_MERGE_GAP_SECONDS = 35.0
 SILENCE_SNAP_WINDOW_SECONDS = 2.0
+# No real podcast ad is a 4–7s keyword sentence — reject micro-cuts.
+MIN_AD_CUT_SECONDS = 15.0
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "start": {"type": "NUMBER"},
+            "end": {"type": "NUMBER"},
+        },
+        "required": ["start", "end"],
+    },
+}
+
+
+@dataclass
+class AdDetectionResult:
+    """Ranges plus whether Gemini ran / failed (for episode-page warnings)."""
+
+    ranges: list[Interval] = field(default_factory=list)
+    gemini_error: str | None = None
+    gemini_ok: bool = False
 
 # Obvious sponsor-read cues (MinusPod AD_START_PHRASES + sports disclaimers).
 _HEURISTIC_RE = re.compile(
@@ -175,17 +201,28 @@ def _extract_json_array(text: str) -> list[dict]:
     return out
 
 
+def _gemini_generation_config(model: str) -> dict:
+    """Build generationConfig: JSON schema + no thinking tokens on Gemini 3.x."""
+    cfg: dict = {
+        # Gemini 3.x docs recommend leaving temperature at default (1.0).
+        "temperature": 1.0,
+        "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+        "responseMimeType": "application/json",
+        "responseSchema": GEMINI_RESPONSE_SCHEMA,
+    }
+    # Thinking tokens eat the output budget on long transcripts; disable them.
+    if "gemini-3" in (model or "").lower():
+        cfg["thinkingConfig"] = {"thinkingBudget": 0}
+    return cfg
+
+
 def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
     """One-shot Gemini generateContent call with retries on transient errors."""
     url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
     payload = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": _gemini_generation_config(model),
     }
     headers = {
         "Content-Type": "application/json",
@@ -311,70 +348,103 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
     return out
 
 
-def find_ads_with_gemini(transcript: dict, progress_cb=None) -> list[Interval]:
-    """One-shot Gemini call on the full transcript. Empty list on soft failure."""
+def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
+    """Gemini ad detection on chunked transcript. Soft-fails with gemini_error set."""
     api_key = resolve_gemini_api_key()
     if not api_key:
         logger.info("No Gemini API key; skipping LLM ad detection")
-        return []
+        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=False)
 
-    body = format_timestamped_transcript(transcript)
-    if not body.strip():
-        return []
+    chunks = chunk_transcript_lines(transcript, max_chars=GEMINI_CHUNK_MAX_CHARS)
+    if not chunks:
+        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
 
     model = gemini_model()
-    user = (
-        "Return JSON array of ad ranges for this transcript.\n\n"
-        f"{body}"
-    )
+    total = len(chunks)
+    all_parsed: list[dict] = []
+    last_err: str | None = None
+    any_ok = False
+
     if progress_cb is not None:
-        progress_cb(0, 1)
-    try:
-        raw = _gemini_generate(api_key, model, user)
-        parsed = _extract_json_array(raw)
-        logger.info("gemini %s -> %d ranges", model, len(parsed))
-    except Exception as primary_exc:
-        # Capacity spikes (503) on the primary model: try a stable fallback once.
-        fallback = GEMINI_FALLBACK_MODEL
-        if model != fallback and "503" in str(primary_exc):
-            logger.warning(
-                "Gemini %s failed (%s); trying fallback %s",
-                model,
-                primary_exc,
-                fallback,
-            )
-            try:
-                raw = _gemini_generate(api_key, fallback, user)
-                parsed = _extract_json_array(raw)
-                logger.info("gemini fallback %s -> %d ranges", fallback, len(parsed))
-            except Exception as fallback_exc:
+        progress_cb(0, total)
+
+    for i, body in enumerate(chunks):
+        user = (
+            "Return JSON array of ad ranges for this transcript chunk "
+            f"({i + 1} of {total}). Timestamps are absolute episode seconds.\n\n"
+            f"{body}"
+        )
+        try:
+            raw = _gemini_generate(api_key, model, user)
+            parsed = _extract_json_array(raw)
+            logger.info("gemini %s chunk %d/%d -> %d ranges", model, i + 1, total, len(parsed))
+            all_parsed.extend(parsed)
+            any_ok = True
+        except Exception as primary_exc:
+            fallback = GEMINI_FALLBACK_MODEL
+            err_text = str(primary_exc)
+            if model != fallback and ("503" in err_text or "429" in err_text or "high demand" in err_text.lower()):
                 logger.warning(
-                    "Gemini ad detection failed (using heuristics only): %s",
-                    fallback_exc,
+                    "Gemini %s chunk %d failed (%s); trying fallback %s",
+                    model,
+                    i + 1,
+                    primary_exc,
+                    fallback,
                 )
-                if progress_cb is not None:
-                    progress_cb(1, 1)
-                return []
-        else:
-            logger.warning("Gemini ad detection failed (using heuristics only): %s", primary_exc)
-            if progress_cb is not None:
-                progress_cb(1, 1)
-            return []
-    if progress_cb is not None:
-        progress_cb(1, 1)
-    return merge_intervals(
-        [Interval(float(r["start"]), float(r["end"])) for r in parsed],
+                try:
+                    raw = _gemini_generate(api_key, fallback, user)
+                    parsed = _extract_json_array(raw)
+                    logger.info(
+                        "gemini fallback %s chunk %d/%d -> %d ranges",
+                        fallback,
+                        i + 1,
+                        total,
+                        len(parsed),
+                    )
+                    all_parsed.extend(parsed)
+                    any_ok = True
+                except Exception as fallback_exc:
+                    last_err = str(fallback_exc)[-300:]
+                    logger.warning(
+                        "Gemini ad detection chunk %d failed: %s",
+                        i + 1,
+                        fallback_exc,
+                    )
+            else:
+                last_err = err_text[-300:]
+                logger.warning(
+                    "Gemini ad detection chunk %d failed: %s",
+                    i + 1,
+                    primary_exc,
+                )
+        if progress_cb is not None:
+            progress_cb(i + 1, total)
+
+    ranges = merge_intervals(
+        [Interval(float(r["start"]), float(r["end"])) for r in all_parsed],
         gap=NEARBY_AD_GAP_SECONDS,
     )
+    if not any_ok and last_err:
+        return AdDetectionResult(ranges=[], gemini_error=last_err, gemini_ok=False)
+    if last_err and any_ok:
+        # Partial success — keep ranges, note the warning.
+        return AdDetectionResult(ranges=ranges, gemini_error=last_err, gemini_ok=True)
+    return AdDetectionResult(ranges=ranges, gemini_error=None, gemini_ok=True)
 
 
-def find_ads_with_zen(transcript: dict, progress_cb=None) -> list[Interval]:
-    """Heuristics + Gemini on the FULL transcript (MinusPod-style). Name kept for call sites."""
+def find_ads_with_zen(transcript: dict, progress_cb=None) -> AdDetectionResult:
+    """Heuristics + Gemini on chunked transcript (MinusPod-style). Name kept for call sites."""
     heur = heuristic_ads(transcript)
-    # Always send the full transcript so Gemini keeps intro/outro/promo-code context.
-    # Union with heuristics as a safety net for obvious sponsor cues.
     llm = find_ads_with_gemini(transcript, progress_cb=progress_cb)
-    return union_ranges(heur, llm)
+    # When Gemini failed entirely, do not keep isolated heuristic micro-cuts —
+    # they look like "ads removed" while leaving real ad breaks intact.
+    merged = union_ranges(heur, llm.ranges)
+    merged = filter_min_duration(merged, min_seconds=MIN_AD_CUT_SECONDS)
+    return AdDetectionResult(
+        ranges=merged,
+        gemini_error=llm.gemini_error,
+        gemini_ok=llm.gemini_ok,
+    )
 
 
 def pad_and_clamp_ads(
@@ -457,7 +527,6 @@ def snap_to_silence(
         return float(times[idx[best_local]])
 
     snapped: list[Interval] = []
-    from . import db as _db
 
     for r in ranges:
         start = nearest_valley(r.start, "before")
@@ -469,7 +538,9 @@ def snap_to_silence(
             end = duration
         start = max(0.0, min(start, duration))
         end = max(0.0, min(end, duration))
-        if end - start >= _db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5:
+        # Keep any non-empty snap; MIN_AD_CUT_SECONDS is enforced later by
+        # filter_min_duration so short fixtures / mid-snap shrinkage still work.
+        if end - start >= 1.0:
             snapped.append(Interval(start, end))
     return merge_intervals(snapped, gap=NEARBY_AD_GAP_SECONDS)
 
@@ -481,8 +552,24 @@ def union_ranges(*groups: list[Interval]) -> list[Interval]:
     return merge_intervals(merged, gap=NEARBY_AD_GAP_SECONDS)
 
 
-def filter_min_duration(ranges: list[Interval], min_seconds: float | None = None) -> list[Interval]:
+def effective_min_ad_seconds(override: float | None = None) -> float:
+    """Floor for kept ad cuts — never below MIN_AD_CUT_SECONDS."""
     from . import db as _db
 
-    floor = min_seconds if min_seconds is not None else _db.runtime_float("min_ad_seconds", minimum=1.0)
+    if override is not None:
+        return max(MIN_AD_CUT_SECONDS, float(override))
+    return max(MIN_AD_CUT_SECONDS, _db.runtime_float("min_ad_seconds", minimum=1.0))
+
+
+def filter_min_duration(ranges: list[Interval], min_seconds: float | None = None) -> list[Interval]:
+    """Drop ranges shorter than min_seconds.
+
+    When min_seconds is omitted, use the configured floor (at least MIN_AD_CUT_SECONDS).
+    An explicit min_seconds is honored as-is (used by tests and callers that already
+    applied effective_min_ad_seconds).
+    """
+    if min_seconds is None:
+        floor = effective_min_ad_seconds()
+    else:
+        floor = float(min_seconds)
     return [r for r in ranges if r.duration >= floor]
