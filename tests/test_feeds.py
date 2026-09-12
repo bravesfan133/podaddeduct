@@ -40,6 +40,7 @@ def test_feed_rewrite_points_at_clean_audio(tmp_path, monkeypatch):
     xml = rewrite_feed_xml(parsed, feed=feed, episodes_by_guid={"g1": ep},
                            public_base="http://192.168.0.93:8080")
     assert f"/audio/{ep.id}" in xml
+    assert f"/audio/{ep.id}?v=" in xml
     assert 'length="100"' in xml  # clean file size, not upstream 999
     assert "<itunes:duration>300</itunes:duration>" in xml
     assert "podcast:chapters" not in xml
@@ -92,6 +93,7 @@ def test_generate_custom_feed_includes_pending(tmp_path, monkeypatch):
     assert "Ready Ep" in xml
     assert "Pending Ep" in xml
     assert f"/audio/{ready.id}" in xml
+    assert f"/audio/{ready.id}?v=" in xml
     assert f"/audio/{pending.id}" in xml
     assert 'length="50"' in xml
     assert "<itunes:duration>120</itunes:duration>" in xml

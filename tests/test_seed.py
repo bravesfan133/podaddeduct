@@ -32,7 +32,7 @@ FIXTURE_TRANSCRIPT = {
 
 def test_format_and_chunk_transcript():
     text = format_timestamped_transcript(FIXTURE_TRANSCRIPT)
-    assert "[4.0-22.0]" in text
+    assert "[00:00:04 - 00:00:22]" in text
     assert "Acme Insurance" in text
     chunks = chunk_transcript_lines(FIXTURE_TRANSCRIPT, max_chars=80)
     assert len(chunks) >= 2
@@ -41,10 +41,12 @@ def test_format_and_chunk_transcript():
 
 def test_extract_json_array_variants():
     assert _extract_json_array('[{"start":1,"end":2}]') == [{"start": 1.0, "end": 2.0}]
-    fenced = '```json\n[{"start": 10, "end": 20}]\n```'
+    fenced = '```json\n{"ads": [{"start": "00:00:10", "end": "00:00:20"}]}\n```'
     assert _extract_json_array(fenced)[0]["start"] == 10.0
     noisy = 'Here you go:\n[{"start":5,"end":9}]\nThanks'
     assert _extract_json_array(noisy)[0]["end"] == 9.0
+    empty = '{"ads": []}'
+    assert _extract_json_array(empty) == []
 
 
 def test_union_merge_and_filter():
@@ -91,22 +93,20 @@ def test_find_ads_with_gemini_mocked():
 
     seen_bodies = []
 
-    def fake_gemini(api_key, model, user_content):
-        seen_bodies.append(user_content)
-        if "Midroll" in user_content or "car commercial" in user_content:
-            return '[{"start": 400.0, "end": 445.0}]'
-        return "[]"
+    def fake_oc(prompt, model=None):
+        seen_bodies.append(prompt)
+        return '{"ads": [{"start": "00:06:40", "end": "00:07:25", "type": "inserted_ad", "sponsor": "unknown", "confidence": 0.9}]}'
 
     with (
-        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
-        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
+        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
+        patch.object(seed_mod, "is_opencode_available", return_value=True),
     ):
         result = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
     ads = result.ranges
-    # Full transcript (including heuristic-covered sponsor lines) goes to Gemini.
+    # Full transcript (including heuristic-covered sponsor lines) goes to the model.
     assert seen_bodies and "brought to you" in seen_bodies[0]
-    assert "Midroll" in seen_bodies[0]
-    # Heuristic covers the sponsor block; Gemini covers midroll.
+    assert "car commercial" in seen_bodies[0]
+    # Heuristic covers the sponsor block; model covers midroll.
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
@@ -168,10 +168,10 @@ def test_find_ads_progress_callback():
 
     seen = []
 
-    def fake_gemini(api_key, model, user_content):
-        return "[]"
+    def fake_oc(prompt, model=None):
+        return '{"ads": []}'
 
-    # Transcript with no heuristic hits so Gemini runs once.
+    # Transcript with no heuristic hits so the model runs once.
     plain = {
         "sentences": [
             {"text": "Baseball talk one.", "start": 0.0, "end": 10.0},
@@ -181,8 +181,8 @@ def test_find_ads_progress_callback():
     }
 
     with (
-        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
-        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
+        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
+        patch.object(seed_mod, "is_opencode_available", return_value=True),
     ):
         seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
@@ -193,4 +193,4 @@ def test_default_gemini_model():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["gemini_model"].default
-    assert default == "gemini-3.5-flash"
+    assert default == "opencode/deepseek-v4-flash-free"

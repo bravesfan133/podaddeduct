@@ -17,6 +17,38 @@ from .ptranscript import parse_transcript_tags, pick_transcript
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
+def enclosure_version(ep: db.Episode, served: Path | None = None) -> int:
+    """Cache-bust token for enclosure URLs so players redownload after a recut."""
+    path = served
+    if path is None:
+        path = db.served_audio_path(ep)
+    if path is not None:
+        try:
+            return int(Path(path).stat().st_mtime)
+        except OSError:
+            pass
+    # Fall back to updated_at epoch if parseable, else 0.
+    raw = (ep.updated_at or "").strip()
+    if raw:
+        try:
+            return int(parsedate_to_datetime(raw).timestamp())
+        except Exception:
+            try:
+                # ISO-ish timestamps stored by the app
+                from datetime import datetime
+
+                return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                pass
+    return 0
+
+
+def enclosure_url_for(ep: db.Episode, public_base: str, served: Path | None = None) -> str:
+    v = enclosure_version(ep, served)
+    base = f"{public_base.rstrip('/')}/audio/{ep.id}"
+    return f"{base}?v={v}" if v else base
+
+
 def slugify(text: str, fallback: str = "feed") -> str:
     s = SLUG_RE.sub("-", text.lower()).strip("-")
     return s[:60] or fallback
@@ -154,7 +186,8 @@ def rewrite_feed_xml(
 
         # Every listed episode is playable, so the enclosure always points
         # at our server — upstream bytes are never referenced.
-        enc_url = f"{public_base.rstrip('/')}/audio/{ep.id}"
+        # ?v=mtime changes after each recut so podcast apps redownload.
+        enc_url = enclosure_url_for(ep, public_base)
 
         length = "0"
         mime = "audio/mpeg"
@@ -168,6 +201,7 @@ def rewrite_feed_xml(
                 length = str(served.stat().st_size)
             except OSError:
                 pass
+            enc_url = enclosure_url_for(ep, public_base, served)
 
         duration_tag = ""
         itunes_duration = getattr(entry, "itunes_duration", None)
@@ -245,7 +279,7 @@ def generate_custom_feed_xml(
             except Exception:
                 pass
 
-        enc_url = f"{public_base.rstrip('/')}/audio/{ep.id}"
+        enc_url = enclosure_url_for(ep, public_base)
         length = str(ep.size_bytes or 0)
         served = db.served_audio_path(ep)
         if served:
@@ -253,6 +287,7 @@ def generate_custom_feed_xml(
                 length = str(served.stat().st_size)
             except OSError:
                 pass
+            enc_url = enclosure_url_for(ep, public_base, served)
 
         duration_tag = ""
         if ep.duration_seconds:

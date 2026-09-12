@@ -17,8 +17,8 @@ logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
-GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
+GEMINI_DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
+GEMINI_FALLBACK_MODEL = "opencode/nemotron-3-ultra-free"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MAX_TRIES = 5
 GEMINI_MAX_OUTPUT_TOKENS = 8192
@@ -34,16 +34,27 @@ SILENCE_SNAP_WINDOW_SECONDS = 2.0
 # No real podcast ad is a 4–7s keyword sentence — reject micro-cuts.
 MIN_AD_CUT_SECONDS = 15.0
 
+ALLOWED_AD_TYPES = {"host_read", "inserted_ad", "unknown_ad"}
+
 GEMINI_RESPONSE_SCHEMA = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "start": {"type": "NUMBER"},
-            "end": {"type": "NUMBER"},
-        },
-        "required": ["start", "end"],
+    "type": "OBJECT",
+    "properties": {
+        "ads": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "start": {"type": "STRING"},
+                    "end": {"type": "STRING"},
+                    "type": {"type": "STRING"},
+                    "sponsor": {"type": "STRING"},
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["start", "end"],
+            },
+        }
     },
+    "required": ["ads"],
 }
 
 
@@ -104,43 +115,223 @@ _HEURISTIC_RE = re.compile(
     r")\b"
 )
 
-SYSTEM_PROMPT = """You mark podcast advertisements for cutting.
-Given a timestamped transcript ([start-end] text per line), return ONLY a JSON array of
-objects {"start": <seconds>, "end": <seconds>} for every ad segment.
+SYSTEM_PROMPT = """You are an advertisement detection classifier for podcast transcripts.
 
-DETECTION VECTORS (what to look for):
-1. SEMANTIC SHIFT:
-   Watch for sudden departures from the main episode topic into universal commercial themes (e.g.
-   health, athletic greens, meal delivery, therapy, VPNs, web hosting, hiring, mattresses,
-   insurance, sports betting, financial apps, security).
-2. DISCLAIMERS & PROMO CODES:
-   Flag phrases like "Go to [URL] and use code...", "visit [URL]", "promo code", "discount code",
-   "at checkout", "Thanks to our sponsor...", "Support for this podcast comes from...",
-   or legal disclaimers like "Must be 21 or older", "gambling problem call 1-800-GAMBLER",
-   "terms and conditions apply".
-3. DYNAMIC & PLATFORM INSERTS:
-   Pre-rolls, mid-rolls, post-rolls, and network promos/station IDs (Acast, Megaphone, iHeart,
-   Spotify for Podcasters, Wondery) that sound like radio commercials.
+Your job is to identify the exact timestamp ranges containing commercial advertisements.
 
-BOUNDARY RULES (critical — leftover tails are failures):
-- AD START: Include the transition INTO the ad ("let's take a break", "a word from our sponsors",
-  "brought to you by", "before we get into it", "first let me tell you about"), not just the pitch.
-- AD END: The ad ends when SHOW CONTENT resumes, NOT when the pitch ends. Wait for:
-  - Topic change back to episode content
-  - Host says "anyway", "alright", "all right", "so", "back to the show" and changes subject
-  - AFTER the final URL / promo code mention (they often repeat it)
-- POST-ROLLS: Mark from the first promotional word through the LAST promotional / disclaimer
-  word (extend through the end of the transcript if the episode ends on ads).
-- Merge contiguous / near-contiguous ad sentences into one range (gaps under ~15 seconds of filler).
-- Use the transcript timestamps exactly.
+You will receive a timestamped transcript of a podcast episode.
 
-WHAT NOT TO MARK:
-- Show content, banter about the topic, or brief brand mentions that are not ads
-- A guest discussing their own work in an interview
-- The host organically mentioning their own other shows / Patreon mid-conversation (not a produced promo block)
+## What counts as an advertisement
 
-STRUCTURED OUTPUT:
-Return [] if there are no ads. No markdown explanation, no commentary — JSON array only."""
+Mark a segment as an advertisement when it is clearly commercial or sponsored, including:
+
+* Host-read sponsor advertisements
+* Dynamically inserted advertisements
+* Pre-recorded advertisements
+* Pre-roll, mid-roll, and post-roll ads
+* Sponsor messages
+* Paid endorsements
+* Promo-code or special-URL reads
+* Free-trial offers
+* Discount offers
+* Calls to purchase, subscribe, download, register, sign up, or visit a sponsor
+* Promotional descriptions of a product or service when clearly connected to sponsorship
+* Multiple sponsors presented consecutively during the same commercial break
+
+Host-read advertisements are especially important. They may sound conversational and may use the same host voice and tone as the rest of the episode.
+
+Common host-read patterns include:
+
+* "This episode is brought to you by..."
+* "Today's sponsor is..."
+* "Thanks to ___ for sponsoring..."
+* "I've been using..."
+* "You guys know I love..."
+* "Go to..."
+* "Use code..."
+* "Get X% off..."
+* "Try it free..."
+* "That's..."
+* "Terms apply."
+* A personal story that transitions into promoting a sponsor
+
+Do not require these exact phrases. Determine whether the content is commercial from its meaning and context.
+
+## What does NOT count as an advertisement
+
+Do NOT mark ordinary podcast conversation as advertising merely because a brand, product, company, website, book, movie, service, or person is mentioned.
+
+Do NOT mark:
+
+* Normal discussion of products or companies
+* Unpaid recommendations
+* News or commentary about a company
+* Products relevant to the podcast topic
+* Casual mentions of something the host uses
+* Listener questions involving products
+* Podcast housekeeping
+* Episode introductions
+* Normal calls to follow or subscribe to the podcast itself
+* Requests to rate or review the podcast
+
+Only classify these as advertisements when there is clear evidence that the segment is sponsored or commercially promotional.
+
+## Podcast self-promotion
+
+Do not normally classify promotion of the current podcast itself as an advertisement.
+
+Examples that are NOT ads:
+
+* "Subscribe to the show."
+* "Leave us a review."
+* "Follow us on Instagram."
+* "Check out last week's episode."
+
+However, promotion for another commercial product, paid subscription, event, network service, course, merchandise, or separate show MAY be advertising if it functions as a commercial break.
+
+## Detecting inserted ads
+
+Inserted advertisements may be obvious because:
+
+* The speaker changes
+* Audio/transcription style changes suddenly
+* The topic changes abruptly
+* A commercial message appears without a host introduction
+* Several unrelated commercial messages appear consecutively
+* Normal podcast conversation resumes abruptly afterward
+
+Treat these as advertisements even if the transcript does not explicitly contain the word "sponsor."
+
+## Determining ad boundaries
+
+Boundary accuracy is important.
+
+Use surrounding context before and after the advertisement to determine where normal podcast content ends and resumes.
+
+The START timestamp should be the earliest supplied timestamp that belongs to the commercial break.
+
+Include a host's transition into the advertisement when the transition is clearly part of the sponsor message.
+
+Example:
+
+Normal discussion
+→ "Before we continue, I want to tell you about..."
+→ sponsor message
+
+The advertisement begins at "Before we continue..."
+
+The END timestamp should be the final supplied timestamp belonging to the advertisement.
+
+Do not include normal conversation after the commercial has finished.
+
+Example:
+
+"...visit example.com and use code SHOW for 20% off."
+→ "Okay, back to what we were talking about..."
+
+The advertisement ends before "Okay, back to what we were talking about."
+
+## Multiple advertisements
+
+If several advertisements occur consecutively with no meaningful podcast content between them, treat the entire sequence as ONE advertisement break.
+
+Example:
+
+Sponsor A
+→ Sponsor B
+→ Sponsor C
+→ podcast resumes
+
+Return one continuous ad range covering all three.
+
+If normal podcast conversation occurs between sponsors, return separate ad ranges.
+
+## Timestamp rules
+
+You MUST use timestamps provided in the transcript.
+
+Never invent timestamps.
+
+Never estimate timestamps based on word count or speaking speed.
+
+If the exact transition occurs between two supplied timestamps, use the closest supplied transcript timestamp that correctly contains the beginning or end of the advertisement.
+
+Do not extend an advertisement simply because you are uncertain.
+
+## Ambiguous segments
+
+Use the complete surrounding context when deciding whether something is an advertisement.
+
+Host-read advertisements can intentionally sound like normal conversation.
+
+Look for combinations of evidence such as:
+
+* Sponsor acknowledgement
+* Product benefits
+* Personal testimonial
+* Promotional language
+* Discount
+* Promo code
+* Special URL
+* Price
+* Trial offer
+* Purchase instructions
+* Call to action
+
+A conversational tone alone is NOT evidence that something is normal podcast content.
+
+When uncertain, assign a lower confidence rather than inventing certainty.
+
+## Output
+
+Return ONLY valid JSON.
+
+Do not return Markdown.
+
+Do not explain your answer.
+
+Do not include text before or after the JSON.
+
+Use exactly this structure:
+
+{
+"ads": [
+{
+"start": "HH:MM:SS",
+"end": "HH:MM:SS",
+"type": "host_read",
+"sponsor": "Sponsor Name",
+"confidence": 0.97
+}
+]
+}
+
+Allowed `type` values:
+
+* `host_read`
+* `inserted_ad`
+* `unknown_ad`
+
+If the sponsor cannot be determined:
+
+"sponsor": "unknown"
+
+Confidence must be a number between 0.0 and 1.0.
+
+If no advertisements are present, return:
+
+{
+"ads": []
+}
+
+Before producing the JSON, silently verify that:
+
+1. Every detected segment is genuinely commercial.
+2. Host-read ads have not been missed because they sound conversational.
+3. Ordinary product discussion has not been incorrectly classified as advertising.
+4. Each start and end timestamp exists in the supplied transcript.
+5. Consecutive ads have been combined appropriately.
+6. Normal podcast content is excluded from the detected ranges."""
 
 
 def resolve_gemini_api_key() -> str | None:
@@ -156,56 +347,134 @@ def gemini_model() -> str:
     return (db.runtime_str("gemini_model") or settings.gemini_model or GEMINI_DEFAULT_MODEL).strip()
 
 
-def _extract_json_array(text: str) -> list[dict]:
+def _parse_timestamp(val) -> float | None:
+    """Parse HH:MM:SS, MM:SS, or numeric seconds into float seconds."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    text = str(val).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    parts = text.split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        h, m, s = nums
+        return h * 3600.0 + m * 60.0 + s
+    if len(nums) == 2:
+        m, s = nums
+        return m * 60.0 + s
+    if len(nums) == 1:
+        return nums[0]
+    return None
+
+
+def _strip_code_fences(text: str) -> str:
     text = (text or "").strip()
+    if "```" not in text:
+        return text
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if m:
+        return m.group(1).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_ads_payload(text: str) -> list[dict]:
+    """Parse model output into [{start, end, ...}] using seconds floats.
+
+    Accepts either {"ads": [...]} (preferred) or a bare JSON array of ranges.
+    """
+    text = _strip_code_fences(text)
     if not text:
         return []
-    if "```" in text:
-        m = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
-        if m:
-            text = m.group(1).strip()
-        else:
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
     data = None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
+        data = None
+
+    if data is None:
+        # Prefer array salvage (handles truncated tails), then object.
+        arr_start = text.find("[")
+        arr_end = text.rfind("]")
+        if arr_start != -1 and arr_end > arr_start:
             try:
-                data = json.loads(text[start : end + 1])
+                data = json.loads(text[arr_start : arr_end + 1])
             except json.JSONDecodeError:
-                last_brace = text[:end].rfind("}")
-                if last_brace > start:
-                    data = json.loads(text[start : last_brace + 1] + "]")
-                else:
-                    raise
-        elif start != -1:
-            last_brace = text.rfind("}")
-            if last_brace > start:
-                data = json.loads(text[start : last_brace + 1] + "]")
+                # Truncated array: salvage complete objects before the cut.
+                last_brace = text[:arr_end].rfind("}") if arr_end != -1 else text.rfind("}")
+                if last_brace > arr_start:
+                    try:
+                        data = json.loads(text[arr_start : last_brace + 1] + "]")
+                    except json.JSONDecodeError:
+                        data = None
+        if data is None:
+            obj_start = text.find("{")
+            obj_end = text.rfind("}")
+            if obj_start != -1 and obj_end > obj_start:
+                data = json.loads(text[obj_start : obj_end + 1])
             else:
-                raise
+                raise ValueError("could not parse ad detection JSON")
+
+    items: list = []
+    if isinstance(data, dict):
+        if "ads" in data:
+            ads = data.get("ads")
+            if not isinstance(ads, list):
+                raise ValueError("ads must be an array")
+            items = ads
+        elif "start" in data and "end" in data:
+            items = [data]
         else:
-            raise
-    if not isinstance(data, list):
-        raise ValueError("expected JSON array")
+            raise ValueError("expected JSON object with ads array")
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise ValueError("expected JSON object or array")
+
     out: list[dict] = []
-    for item in data:
+    for item in items:
         if not isinstance(item, dict):
             continue
         if "start" not in item or "end" not in item:
             continue
-        try:
-            start = float(item["start"])
-            end = float(item["end"])
-        except (TypeError, ValueError):
+        start = _parse_timestamp(item.get("start"))
+        end = _parse_timestamp(item.get("end"))
+        if start is None or end is None or end <= start:
             continue
-        if end > start:
-            out.append({"start": start, "end": end})
+        ad_type = str(item.get("type") or "unknown_ad").strip() or "unknown_ad"
+        if ad_type not in ALLOWED_AD_TYPES:
+            ad_type = "unknown_ad"
+        sponsor = str(item.get("sponsor") or "unknown").strip() or "unknown"
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        out.append(
+            {
+                "start": start,
+                "end": end,
+                "type": ad_type,
+                "sponsor": sponsor,
+                "confidence": confidence,
+            }
+        )
     return out
+
+
+def _extract_json_array(text: str) -> list[dict]:
+    """Compatibility wrapper — returns [{start, end}] from model output."""
+    return [{"start": r["start"], "end": r["end"]} for r in _extract_ads_payload(text)]
 
 
 def _gemini_generation_config(model: str) -> dict:
@@ -284,10 +553,10 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
 
 
 OPENCODE_DEFAULT_MODELS = [
-    "opencode/kimi-k2.5",
-    "opencode/minimax-m2.5",
-    "opencode/mimo-v2.5-free",
+    "opencode/deepseek-v4-flash-free",
+    "opencode/nemotron-3-ultra-free",
     "opencode/nemotron-3.5-lightning-free",
+    "opencode/mimo-v2.5-free",
 ]
 
 
@@ -309,6 +578,16 @@ def is_opencode_available() -> bool:
     return get_opencode_bin() is not None
 
 
+def _models_to_try(model: str | None = None) -> list[str]:
+    models_to_try: list[str] = []
+    if (model or "").strip():
+        models_to_try.append(model.strip())
+    for m in OPENCODE_DEFAULT_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+    return models_to_try
+
+
 def opencode_generate(prompt: str, model: str | None = None) -> str:
     """Invoke opencode CLI runner to generate JSON response."""
     import subprocess
@@ -317,25 +596,23 @@ def opencode_generate(prompt: str, model: str | None = None) -> str:
     if not bin_path:
         raise RuntimeError("opencode CLI not found in PATH")
 
-    models_to_try = [model.strip()] if (model or "").strip() else list(OPENCODE_DEFAULT_MODELS)
+    models_to_try = _models_to_try(model)
     last_err = ""
 
     for m in models_to_try:
         cmd = [bin_path, "run", prompt, "-m", m, "--pure"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
-            last_err = f"opencode timed out after 180s on {m}"
+            last_err = f"opencode timed out after 300s on {m}"
             logger.warning(last_err)
             continue
         if proc.returncode == 0:
+            logger.info("opencode succeeded with model %s", m)
             return proc.stdout
         err_msg = (proc.stderr or proc.stdout or "").strip()
         last_err = f"{m} failed ({proc.returncode}): {err_msg[:200]}"
-        if any(w in err_msg.lower() for w in ("insufficient balance", "creditserror", "unauthorized")):
-            logger.warning("opencode %s credits unavailable; trying next model", m)
-            continue
-        logger.warning("opencode attempt failed: %s", last_err)
+        logger.warning("opencode attempt failed: %s; trying next model", last_err)
 
     raise RuntimeError(f"opencode failed: {last_err}")
 
@@ -346,15 +623,10 @@ def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDete
     if not body.strip():
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
 
-    user = (
-        "Return JSON array of ad ranges for this podcast transcript. "
-        "Timestamps are in seconds [start-end].\n\n"
-        f"{body}"
-    )
-    prompt = SYSTEM_PROMPT + "\n\n" + user
+    prompt = SYSTEM_PROMPT + "\n\nTIMESTAMPED TRANSCRIPT:\n\n" + body
     try:
         raw = opencode_generate(prompt, model=model)
-        parsed = _extract_json_array(raw)
+        parsed = _extract_ads_payload(raw)
         logger.info("opencode ad detection -> %d ranges", len(parsed))
         ranges = merge_intervals(
             [Interval(float(r["start"]), float(r["end"])) for r in parsed],
@@ -370,10 +642,13 @@ def test_gemini_connection(model: str | None = None) -> dict:
     """Send one tiny request to prove key + model work. Never raises."""
     try:
         use_model = (model or "").strip() or gemini_model()
-        if use_model.startswith("opencode") or (not resolve_gemini_api_key() and is_opencode_available()):
+        if use_model.startswith("opencode") or is_opencode_available():
             start = time.monotonic()
-            raw = opencode_generate("Return strictly JSON: []", model=use_model if use_model.startswith("opencode") else None)
-            parsed = _extract_json_array(raw)
+            raw = opencode_generate(
+                'Return ONLY valid JSON: {"ads": []}',
+                model=use_model if use_model.startswith("opencode") else None,
+            )
+            parsed = _extract_ads_payload(raw)
             ms = int((time.monotonic() - start) * 1000)
             return {
                 "ok": True,
@@ -384,10 +659,10 @@ def test_gemini_connection(model: str | None = None) -> dict:
             }
         api_key = resolve_gemini_api_key()
         if not api_key:
-            return {"ok": False, "error": "No Gemini API key saved yet."}
+            return {"ok": False, "error": "No OpenCode CLI or Gemini API key available."}
         start = time.monotonic()
-        raw = _gemini_generate(api_key, use_model, "Return exactly: []")
-        parsed = _extract_json_array(raw)
+        raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
+        parsed = _extract_ads_payload(raw)
         ms = int((time.monotonic() - start) * 1000)
         return {
             "ok": True,
@@ -457,30 +732,38 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
 
 
 def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """One-shot AI ad detection on full transcript using Gemini or OpenCode CLI."""
+    """One-shot AI ad detection on full transcript using OpenCode (default) or Gemini."""
     model = gemini_model()
-    if model.startswith("opencode"):
+
+    # OpenCode is the default path — model IDs start with "opencode".
+    if model.startswith("opencode") or (not resolve_gemini_api_key() and is_opencode_available()):
         if progress_cb is not None:
             progress_cb(0, 1)
-        res = find_ads_with_opencode(transcript, model=model)
+        res = find_ads_with_opencode(
+            transcript,
+            model=model if model.startswith("opencode") else None,
+        )
         if progress_cb is not None:
             progress_cb(1, 1)
         return res
 
     api_key = resolve_gemini_api_key()
     if not api_key:
-        logger.info("No Gemini API key; skipping LLM ad detection")
+        if is_opencode_available():
+            if progress_cb is not None:
+                progress_cb(0, 1)
+            res = find_ads_with_opencode(transcript)
+            if progress_cb is not None:
+                progress_cb(1, 1)
+            return res
+        logger.info("No Gemini API key / OpenCode CLI; skipping LLM ad detection")
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=False)
 
     body = format_timestamped_transcript(transcript)
     if not body.strip():
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
 
-    user = (
-        "Return JSON array of ad ranges for this podcast transcript. "
-        "Timestamps are in seconds [start-end].\n\n"
-        f"{body}"
-    )
+    user = "TIMESTAMPED TRANSCRIPT:\n\n" + body
     last_err: str | None = None
     parsed: list[dict] = []
 
@@ -489,33 +772,14 @@ def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResul
 
     try:
         raw = _gemini_generate(api_key, model, user)
-        parsed = _extract_json_array(raw)
+        parsed = _extract_ads_payload(raw)
         logger.info("gemini %s -> %d ranges", model, len(parsed))
     except Exception as primary_exc:
-        fallback = GEMINI_FALLBACK_MODEL
         err_text = str(primary_exc)
-        if model != fallback and ("503" in err_text or "429" in err_text or "high demand" in err_text.lower() or "quota" in err_text.lower()):
-            logger.warning(
-                "Gemini %s failed (%s); trying fallback %s",
-                model,
-                primary_exc,
-                fallback,
-            )
-            try:
-                raw = _gemini_generate(api_key, fallback, user)
-                parsed = _extract_json_array(raw)
-                logger.info("gemini fallback %s -> %d ranges", fallback, len(parsed))
-            except Exception as fallback_exc:
-                last_err = str(fallback_exc)[-300:]
-                logger.warning("Gemini fallback %s failed: %s", fallback, fallback_exc)
-        else:
-            last_err = err_text[-300:]
-            logger.warning("Gemini ad detection failed: %s", primary_exc)
+        last_err = err_text[-300:]
+        logger.warning("Gemini ad detection failed: %s", primary_exc)
 
-        # If Gemini quota exceeded or failed completely, fall back to OpenCode CLI if enabled
-        from . import db as _db
-
-        if not parsed and (settings.opencode_fallback or _db.runtime_bool("opencode_fallback")) and is_opencode_available():
+        if is_opencode_available():
             logger.warning("Gemini failed (%s); attempting OpenCode CLI backup", last_err)
             opencode_res = find_ads_with_opencode(transcript)
             if opencode_res.gemini_ok:

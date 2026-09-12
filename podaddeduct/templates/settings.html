@@ -49,10 +49,10 @@
 
   <div class="card">
     <h2>Ad detection</h2>
-    <p class="sub">Paste a free <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> key. Gemini Flash spots sponsor reads in one shot when the publisher didn't already mark them. {% if gemini.configured %}<span class="ok">Connected ({{ gemini.source }}).</span>{% else %}<span class="warn">Not connected yet — heuristics still cut obvious sponsor reads.</span>{% endif %}</p>
+    <p class="sub">Uses OpenCode CLI by default (<code>opencode/deepseek-v4-flash-free</code>, falls back to <code>opencode/nemotron-3-ultra-free</code>). Optional Gemini key still works if you set a <code>gemini-*</code> model. {% if gemini.configured %}<span class="ok">Gemini key saved ({{ gemini.source }}).</span>{% endif %}</p>
     {% if saved == 'gemini' %}<p class="ok">Key saved.</p>{% endif %}
     <form method="post" action="/settings/gemini-key">
-      <label>Gemini API key</label>
+      <label>Gemini API key <span class="muted">(optional — only needed for gemini-* models)</span></label>
       <input name="gemini_api_key" type="password" autocomplete="off" placeholder="{% if gemini.configured %}Saved ({{ gemini.hint }}) — paste to replace{% else %}Paste key…{% endif %}" />
       <button type="submit">Save key</button>
       <button type="submit" name="clear" value="1" class="ghost">Remove</button>
@@ -64,7 +64,7 @@
       <form method="post" action="/settings/global">
         <input type="hidden" name="settings_form" value="1" />
         <div class="row">
-          <div><label>Gemini model</label><input name="gemini_model" type="text" value="{{ global_settings.gemini_model }}" placeholder="{{ effective.gemini_model or 'gemini-3.5-flash' }}" /></div>
+          <div><label>Ad detection model</label><input name="gemini_model" type="text" value="{{ global_settings.gemini_model }}" placeholder="{{ effective.gemini_model or 'opencode/deepseek-v4-flash-free' }}" /></div>
         </div>
         <button type="submit">Save model</button>
       </form>
@@ -85,6 +85,10 @@
       </div>
       <button type="submit">Save</button>
       {% if saved == 'settings' %}<span class="ok">Saved.</span>{% endif %}
+    </form>
+    <form method="post" action="/settings/reprocess-all" style="margin-top:1rem" onsubmit="return confirm('Reprocess ALL episodes across every show? This re-runs ad detection (reuses existing transcripts) and may take a while.')">
+      <button type="submit" class="ghost">Reprocess all episodes</button>
+      {% if saved == 'reprocess' %}<span class="ok">Queued {{ reprocess_n or '0' }} episodes.</span>{% endif %}
     </form>
   </div>
 

@@ -46,6 +46,9 @@
     <form method="post" action="/shows/{{ feed.slug }}/prepare" style="display:inline">
       <button type="submit" class="ghost">Prepare next 5</button>
     </form>
+    <form method="post" action="/shows/{{ feed.slug }}/reprocess-all" style="display:inline" onsubmit="return confirm('Reprocess all episodes of this show? This re-runs ad detection using existing transcripts.')">
+      <button type="submit" class="ghost">Reprocess all</button>
+    </form>
     <form method="post" action="/shows/{{ feed.slug }}/delete" style="display:inline" onsubmit="return confirm('Remove this show and delete its downloaded files?')">
       <button type="submit" class="danger">Remove show</button>
     </form>

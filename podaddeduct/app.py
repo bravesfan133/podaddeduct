@@ -427,6 +427,7 @@ async def settings_page(request: Request) -> HTMLResponse:
             "password_source": password_source(),
             "app_version": APP_VERSION,
             "saved": request.query_params.get("saved"),
+            "reprocess_n": request.query_params.get("n"),
             "settings_error": request.query_params.get("err"),
         },
     )
@@ -813,6 +814,34 @@ async def prepare_next(slug: str, request: Request) -> RedirectResponse:
     return RedirectResponse(f"/shows/{slug}?queued={queued}", status_code=303)
 
 
+@app.post("/shows/{slug}/reprocess-all")
+async def reprocess_show(slug: str, request: Request) -> RedirectResponse:
+    """Re-queue every episode of a show for ad re-detection (keeps transcripts)."""
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    feed = db.get_feed_by_slug(slug)
+    if not feed:
+        raise HTTPException(404, "Show not found")
+    queued = 0
+    for ep in db.list_episodes(feed.id):
+        if await enqueue_episode(ep.id, reseed=True):
+            queued += 1
+    return RedirectResponse(f"/shows/{slug}?queued={queued}&reprocess=1", status_code=303)
+
+
+@app.post("/settings/reprocess-all")
+async def reprocess_all_settings(request: Request) -> RedirectResponse:
+    """Re-queue every episode across every show for ad re-detection."""
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    queued = 0
+    for feed in db.list_feeds():
+        for ep in db.list_episodes(feed.id):
+            if await enqueue_episode(ep.id, reseed=True):
+                queued += 1
+    return RedirectResponse(f"/settings?saved=reprocess&n={queued}", status_code=303)
+
+
 @app.post("/shows/{slug}/refresh")
 async def refresh_show(slug: str, request: Request) -> RedirectResponse:
     if not _authed(request):
@@ -952,6 +981,23 @@ async def audio(episode_id: int, request: Request) -> Response:
         raise HTTPException(404, "Episode not found")
 
     if request.method == "HEAD":
+        # Prefer clean/served file headers so players see updated length/ETag after recut.
+        served = db.served_audio_path(ep)
+        if served and served.exists():
+            try:
+                st = served.stat()
+                from email.utils import formatdate
+
+                headers = {
+                    "content-type": "audio/mpeg",
+                    "content-length": str(st.st_size),
+                    "accept-ranges": "bytes",
+                    "last-modified": formatdate(st.st_mtime, usegmt=True),
+                    "etag": f'W/"pad-{episode_id}-{int(st.st_mtime)}-{st.st_size}"',
+                }
+                return Response(status_code=200, headers=headers)
+            except OSError:
+                pass
         try:
             async with httpx.AsyncClient(
                 timeout=30.0, follow_redirects=True,

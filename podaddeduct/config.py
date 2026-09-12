@@ -57,8 +57,8 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
     )
-    gemini_model: str = "gemini-3.5-flash"
-    opencode_fallback: bool = False
+    gemini_model: str = "opencode/deepseek-v4-flash-free"
+    opencode_fallback: bool = True
     silence_snap_window: float = 2.0
 
     @property

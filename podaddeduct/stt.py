@@ -20,8 +20,16 @@ def load_transcript(path: Path) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def format_hms(seconds: float) -> str:
+    """Format seconds as HH:MM:SS (floor to whole seconds)."""
+    total = max(0, int(float(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def format_timestamped_transcript(transcript: dict, *, max_chars: int | None = None) -> str:
-    """One sentence per line: [start-end] text"""
+    """One sentence per line: [HH:MM:SS - HH:MM:SS] text"""
     lines: list[str] = []
     for s in transcript.get("sentences") or []:
         text = (s.get("text") or "").strip()
@@ -29,7 +37,7 @@ def format_timestamped_transcript(transcript: dict, *, max_chars: int | None = N
             continue
         start = float(s["start"])
         end = float(s["end"])
-        lines.append(f"[{start:.1f}-{end:.1f}] {text}")
+        lines.append(f"[{format_hms(start)} - {format_hms(end)}] {text}")
     body = "\n".join(lines)
     if max_chars is not None and len(body) > max_chars:
         return body[:max_chars]
@@ -43,7 +51,9 @@ def chunk_transcript_lines(transcript: dict, *, max_chars: int = 12000) -> list[
         text = (s.get("text") or "").strip()
         if not text:
             continue
-        lines.append(f"[{float(s['start']):.1f}-{float(s['end']):.1f}] {text}")
+        start = float(s["start"])
+        end = float(s["end"])
+        lines.append(f"[{format_hms(start)} - {format_hms(end)}] {text}")
     if not lines:
         return []
     chunks: list[str] = []
