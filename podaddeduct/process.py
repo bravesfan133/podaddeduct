@@ -14,6 +14,7 @@ from .decode import load_mono_pcm
 from .download import complete_marker_for, download_file
 from .intervals import Interval
 from .seed import filter_min_duration, find_ads_with_zen, snap_to_silence
+from .stt import transcribe_audio
 
 logger = logging.getLogger("podaddeduct.process")
 
@@ -299,7 +300,22 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
 
     _job_stage("transcribing")
     t0 = time.monotonic()
-    transcript = transcribe_audio(audio_path, transcript_path_for(episode_id), force=False)
+    transcript = None
+    if ep is not None:
+        # Cascade: publisher transcript (free, instant) before any STT.
+        from .ptranscript import try_publisher_transcript
+
+        transcript = try_publisher_transcript(ep, duration)
+        if transcript is not None:
+            try:
+                dest = transcript_path_for(episode_id)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                logger.warning("episode %s could not cache publisher transcript", episode_id)
+    if transcript is None:
+        transcript = transcribe_audio(audio_path, transcript_path_for(episode_id), force=False)
+        transcript.setdefault("source", "local")
     n_sent = len((transcript.get("sentences") or []))
     logger.info("episode %s transcribed %d sentences in %.0fs", episode_id, n_sent, time.monotonic() - t0)
     db.update_episode(episode_id, status="working", error="Finding ads…")

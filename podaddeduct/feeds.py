@@ -12,6 +12,7 @@ import httpx
 
 from .config import settings
 from . import db
+from .ptranscript import parse_transcript_tags, pick_transcript
 
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -73,6 +74,16 @@ def entry_pub_date(entry: Any) -> str | None:
         if val:
             return str(val)
     return None
+
+
+def transcript_for_entry(entry: Any, enclosure: str, tag_map: dict) -> tuple[str | None, str | None]:
+    """Best publisher transcript link for an entry, or (None, None)."""
+    guid = entry_guid(entry, enclosure)
+    links = tag_map.get(guid) or tag_map.get(enclosure) or []
+    best = pick_transcript(links)
+    if not best:
+        return None, None
+    return best["url"], best["type"]
 
 
 def _xml_text(value: str | None) -> str:

@@ -33,8 +33,10 @@ While an episode is still being cleaned, the app plays the publisher's original 
 Transcription + OpenCode Zen to spot sponsor reads, snapped to silence, cut with ffmpeg. Everything is configured in **Settings** (gear icon, top right) — no config files needed:
 
 - **Ad detection card:** paste the API key once, pick the model (listed from your key), Test button proves it works.
-- **Server card:** transcription backend shortcut (Mac Parakeet / Linux faster-whisper), public address for Overcast, family password.
+- **Server card:** transcription backend shortcut (Mac Parakeet / Linux faster-whisper / Groq cloud), Groq API key, public address for Overcast, family password.
 - **Processing card:** how many episodes to prepare, shortest ad to cut, auto-prepare on/off.
+
+Transcripts come from the fastest available source, automatically: publisher-provided file in the RSS feed when one exists (free, instant) → Groq Whisper API (~1–2 min, needs free key from console.groq.com) → local faster-whisper on CPU.
 
 - **Mac dev:** local Parakeet transcription (Apple Silicon sidecar):
 

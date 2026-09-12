@@ -31,6 +31,7 @@
       <span class="pill">New — press Prepare below</span>
     {% endif %}
     {% if saved_seconds %}&nbsp;·&nbsp;{{ '%d:%02d'|format(saved_seconds//60, saved_seconds%60) }} of ads skipped{% endif %}
+    {% if transcript_source %}&nbsp;·&nbsp;Transcript: {{ transcript_source }}{% endif %}
   </p>
   {% if episode.status == 'error' %}
   <p class="err">{{ friendly_error or "Processing failed — hit Prepare below to retry." }}</p>

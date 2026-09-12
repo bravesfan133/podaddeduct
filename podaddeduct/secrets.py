@@ -51,6 +51,31 @@ def set_zen_api_key(key: str | None) -> None:
     save_secrets({"zen_api_key": key or None})
 
 
+def get_groq_api_key() -> str | None:
+    """UI-saved key first, then GROQ_API_KEY env."""
+    import os
+
+    stored = (load_secrets().get("groq_api_key") or "").strip()
+    if stored:
+        return stored
+    env = (os.environ.get("GROQ_API_KEY") or "").strip()
+    return env or None
+
+
+def set_groq_api_key(key: str | None) -> None:
+    key = (key or "").strip()
+    save_secrets({"groq_api_key": key or None})
+
+
+def groq_key_status() -> dict:
+    stored = bool((load_secrets().get("groq_api_key") or "").strip())
+    import os
+
+    env = bool((os.environ.get("GROQ_API_KEY") or "").strip())
+    source = "ui" if stored else ("env" if env else None)
+    return {"configured": bool(stored or env), "source": source}
+
+
 def get_app_password() -> str:
     """Effective family password: UI value wins ("" disables), else env."""
     data = load_secrets()

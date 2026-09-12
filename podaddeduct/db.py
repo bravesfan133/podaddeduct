@@ -38,6 +38,8 @@ class Episode:
     enclosure_url: str
     pub_date: str | None
     pub_ts: float = 0.0
+    transcript_url: str | None = None
+    transcript_type: str | None = None
     duration_seconds: float | None = None
     status: str = "pending"
     audio_path: str | None = None
@@ -83,6 +85,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     enclosure_url TEXT NOT NULL,
     pub_date TEXT,
     pub_ts REAL NOT NULL DEFAULT 0,
+    transcript_url TEXT,
+    transcript_type TEXT,
     duration_seconds REAL,
     status TEXT NOT NULL DEFAULT 'pending',
     audio_path TEXT,
@@ -119,6 +123,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE episodes ADD COLUMN last_served_at TEXT")
     if "pub_ts" not in ep_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN pub_ts REAL NOT NULL DEFAULT 0")
+    if "transcript_url" not in ep_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN transcript_url TEXT")
+    if "transcript_type" not in ep_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN transcript_type TEXT")
     # Backfill sortable timestamps for rows written before pub_ts existed.
     try:
         stale = conn.execute(
@@ -178,6 +186,8 @@ def _episode_from_row(row: sqlite3.Row) -> Episode:
         enclosure_url=row["enclosure_url"],
         pub_date=row["pub_date"],
         pub_ts=float(row["pub_ts"] or 0.0) if "pub_ts" in keys else 0.0,
+        transcript_url=row["transcript_url"] if "transcript_url" in keys else None,
+        transcript_type=row["transcript_type"] if "transcript_type" in keys else None,
         duration_seconds=row["duration_seconds"],
         status=row["status"],
         audio_path=row["audio_path"],
@@ -266,6 +276,8 @@ def upsert_episode(
     title: str,
     enclosure_url: str,
     pub_date: str | None,
+    transcript_url: str | None = None,
+    transcript_type: str | None = None,
 ) -> Episode:
     existing = get_episode_by_guid(feed_id, guid)
     now = _utc_now()
@@ -279,20 +291,22 @@ def upsert_episode(
                     """
                     UPDATE episodes
                     SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?,
+                        transcript_url = ?, transcript_type = ?,
                         audio_path = NULL, status = 'pending', error = NULL,
                         ad_ranges_json = '[]', clean_audio_path = NULL
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, ts, now, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type, existing.id),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE episodes
-                    SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?
+                    SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?,
+                        transcript_url = ?, transcript_type = ?
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, ts, now, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type, existing.id),
                 )
         ep = get_episode(existing.id)
         assert ep is not None
@@ -303,10 +317,11 @@ def upsert_episode(
             """
             INSERT INTO episodes (
                 feed_id, guid, title, enclosure_url, pub_date, pub_ts,
+                transcript_url, transcript_type,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             """,
-            (feed_id, guid, title, enclosure_url, pub_date, ts, now),
+            (feed_id, guid, title, enclosure_url, pub_date, ts, transcript_url, transcript_type, now),
         )
         episode_id = int(cur.lastrowid)
     ep = get_episode(episode_id)
@@ -321,7 +336,8 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
     fsync per row — ~50s on slow disks, on EVERY feed view. One transaction
     with a single commit: well under a second. Same per-row semantics as
     upsert_episode (enclosure change resets processing state).
-    Items: dicts with guid/title/enclosure_url/pub_date keys.
+    Items: dicts with guid/title/enclosure_url/pub_date keys
+    (plus optional transcript_url/transcript_type).
     """
     now = _utc_now()
     rows = [
@@ -331,6 +347,8 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             str(it["enclosure_url"]),
             it.get("pub_date"),
             pub_ts_for(it.get("pub_date")),
+            it.get("transcript_url"),
+            it.get("transcript_type"),
         )
         for it in items
         if it.get("guid") and it.get("enclosure_url")
@@ -342,13 +360,16 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             """
             INSERT INTO episodes (
                 feed_id, guid, title, enclosure_url, pub_date, pub_ts,
+                transcript_url, transcript_type,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             ON CONFLICT(feed_id, guid) DO UPDATE SET
                 title = excluded.title,
                 enclosure_url = excluded.enclosure_url,
                 pub_date = excluded.pub_date,
                 pub_ts = excluded.pub_ts,
+                transcript_url = excluded.transcript_url,
+                transcript_type = excluded.transcript_type,
                 updated_at = excluded.updated_at,
                 audio_path = CASE
                     WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
@@ -366,7 +387,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
                     WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
                     ELSE episodes.error END
             """,
-            [(feed_id, guid, title, enc, pub, ts, now) for (guid, title, enc, pub, ts) in rows],
+            [(feed_id, guid, title, enc, pub, ts, turl, ttype, now) for (guid, title, enc, pub, ts, turl, ttype) in rows],
         )
         sel = conn.execute(
             f"SELECT * FROM episodes WHERE feed_id = ? AND guid IN ({','.join('?' * len(rows))})",

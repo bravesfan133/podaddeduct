@@ -148,11 +148,22 @@ def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> di
     stt_audio = _audio_for_stt(audio_path)
     cmd = [str(python), str(script), str(stt_audio), str(dest), model]
     logger.info("STT sidecar: %s", " ".join(cmd))
+    # Sidecars needing cloud keys (stt_groq.py) get them via env, resolved
+    # the same way as the UI: secrets.json first, then process env.
+    import os
+
+    from .secrets import get_groq_api_key
+
+    env = dict(os.environ)
+    groq_key = get_groq_api_key()
+    if groq_key and "GROQ_API_KEY" not in env:
+        env["GROQ_API_KEY"] = groq_key
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     if proc.returncode != 0:
         raise RuntimeError(

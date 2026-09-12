@@ -103,6 +103,7 @@
           <select id="stt_backend">
             <option value="parakeet">Mac — Parakeet (Apple Silicon)</option>
             <option value="faster">Linux / server — faster-whisper (CPU)</option>
+            <option value="groq">Cloud — Groq Whisper API (fastest)</option>
             <option value="custom">Custom paths…</option>
           </select>
         </div>
@@ -113,6 +114,16 @@
         <div><label>Transcription script</label><input name="stt_sidecar" id="stt_sidecar" type="text" value="{{ global_settings.stt_sidecar }}" placeholder="{{ effective.stt_sidecar }}" /></div>
       </div>
       <button type="submit">Save</button>
+    </form>
+    <form method="post" action="/settings/groq-key" style="margin-top:1rem">
+      <label>Groq API key <span class="muted">(cloud transcription — get one free at console.groq.com)</span>
+        {% if groq.configured %}<span class="ok">(saved via {{ groq.source }})</span>{% endif %}</label>
+      <div class="row">
+        <div><input name="groq_api_key" type="password" autocomplete="off" placeholder="{% if groq.configured %}Saved — paste to replace{% else %}gsk_…{% endif %}" /></div>
+      </div>
+      <button type="submit">Save key</button>
+      <button type="submit" name="clear" value="1" class="ghost">Remove</button>
+      {% if saved == 'groq' %}<span class="ok">Saved.</span>{% endif %}
     </form>
     <form method="post" action="/settings/password" style="margin-top:1rem">
       <label>Family password {% if password_set %}<span class="ok">(set{% if password_source == 'env' %} in environment{% endif %})</span>{% else %}<span class="muted">(off — anyone on your network can open this page)</span>{% endif %}</label>
@@ -160,12 +171,14 @@ if (zenTest) zenTest.addEventListener('click', async () => {
 const BACKENDS = {
   parakeet: {python: './.venv-stt/bin/python', sidecar: './scripts/stt_sidecar.py', model: 'mlx-community/parakeet-tdt-0.6b-v3'},
   faster: {python: 'python', sidecar: './scripts/stt_faster.py', model: 'base'},
+  groq: {python: 'python', sidecar: './scripts/stt_groq.py', model: 'whisper-large-v3-turbo'},
 };
 const backendSel = document.getElementById('stt_backend'), sidecarIn = document.getElementById('stt_sidecar'), modelIn = document.getElementById('stt_model');
 function pickBackend() {
   if (!backendSel) return;
   const cur = (sidecarIn && sidecarIn.value) || (sidecarIn && sidecarIn.placeholder) || '';
-  if (cur.includes('stt_faster')) backendSel.value = 'faster';
+  if (cur.includes('stt_groq')) backendSel.value = 'groq';
+  else if (cur.includes('stt_faster')) backendSel.value = 'faster';
   else if (cur.includes('stt_sidecar')) backendSel.value = 'parakeet';
   else backendSel.value = 'custom';
 }

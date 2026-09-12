@@ -32,9 +32,18 @@ from .feeds import (
     parse_feed,
     rewrite_feed_xml,
     slug_for_upstream,
+    transcript_for_entry,
 )
 from .process import enqueue_episode, ensure_worker, friendly_error
-from .secrets import get_app_password, password_source, set_app_password, set_zen_api_key, zen_key_status
+from .secrets import (
+    get_app_password,
+    groq_key_status,
+    password_source,
+    set_app_password,
+    set_groq_api_key,
+    set_zen_api_key,
+    zen_key_status,
+)
 
 logger = logging.getLogger("podaddeduct")
 logging.basicConfig(level=logging.INFO)
@@ -177,19 +186,29 @@ async def sync_feed_episodes(
     if art and art != (feed.artwork_url or ""):
         db.update_feed_artwork(feed.id, art)
 
-    episodes = db.upsert_episodes_batch(
-        feed.id,
-        [
+    from .ptranscript import parse_transcript_tags
+
+    try:
+        tmap = parse_transcript_tags(raw)
+    except Exception:
+        tmap = {}
+    items: list[dict] = []
+    for entry in parsed.entries:
+        enclosure = entry_enclosure(entry)
+        if not enclosure:
+            continue
+        turl, ttype = transcript_for_entry(entry, enclosure, tmap)
+        items.append(
             {
                 "guid": entry_guid(entry, enclosure),
                 "title": str(getattr(entry, "title", None) or "Episode"),
                 "enclosure_url": enclosure,
                 "pub_date": entry_pub_date(entry),
+                "transcript_url": turl,
+                "transcript_type": ttype,
             }
-            for entry in parsed.entries
-            if (enclosure := entry_enclosure(entry))
-        ],
-    )
+        )
+    episodes = db.upsert_episodes_batch(feed.id, items)
 
     fs = db.get_feed_settings(feed)
     auto_on = fs.get("auto_download", True) and db.runtime_bool("auto_prepare_latest")
@@ -399,6 +418,7 @@ async def settings_page(request: Request) -> HTMLResponse:
             "global_settings": db.get_global_settings(),
             "effective": eff,
             "zen": zen_key_status(),
+            "groq": groq_key_status(),
             "password_set": bool(get_app_password()),
             "password_source": password_source(),
             "app_version": APP_VERSION,
@@ -506,6 +526,21 @@ async def save_zen_key(
     if _urlparse2(ref).path.startswith("/settings"):
         return RedirectResponse("/settings?saved=zen", status_code=303)
     return RedirectResponse("/?saved=zen", status_code=303)
+
+
+@app.post("/settings/groq-key")
+async def save_groq_key(
+    request: Request,
+    groq_api_key: str = Form(""),
+    clear: str = Form(""),
+) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    if clear:
+        set_groq_api_key(None)
+    else:
+        set_groq_api_key(groq_api_key)
+    return RedirectResponse("/settings?saved=groq", status_code=303)
 
 
 @app.get("/api/zen-status")
@@ -802,6 +837,15 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
     feed = db.get_feed(ep.feed_id)
     ranges = db.get_ad_ranges(ep)
     saved = round(sum(max(0.0, r["end"] - r["start"]) for r in ranges), 1)
+    transcript_source = None
+    try:
+        from .stt import load_transcript, transcript_path_for
+
+        cached = load_transcript(transcript_path_for(ep.id))
+        if cached:
+            transcript_source = cached.get("source") or "local"
+    except Exception:
+        transcript_source = None
     return templates.TemplateResponse(
         request,
         "episode.html",
@@ -818,6 +862,7 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
             "has_clean": db.has_clean_audio(ep),
             "has_audio": bool(db.served_audio_path(ep)),
             "friendly_error": friendly_error(ep.error),
+            "transcript_source": transcript_source,
         },
     )
 
