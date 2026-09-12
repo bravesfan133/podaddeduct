@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # Optional shared password when exposed via tunnel (empty = no login locally).
     app_password: str = ""
 
-    # Local Parakeet (Mac) / faster-whisper (Linux) + Google Gemini Direct for ads.
+    # Local Parakeet (Mac) / faster-whisper (Linux) + OpenCode CLI for ads.
     stt_python: str = "./.venv-stt/bin/python"
     stt_sidecar: str = "./scripts/stt_sidecar.py"
     stt_model: str = "mlx-community/parakeet-tdt-0.6b-v3"

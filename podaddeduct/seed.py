@@ -341,6 +341,11 @@ def resolve_gemini_api_key() -> str | None:
     return get_gemini_api_key()
 
 
+def is_gemini_model(model: str | None) -> bool:
+    m = (model or "").strip().lower()
+    return m.startswith("gemini-") or m.startswith("models/gemini")
+
+
 def gemini_model() -> str:
     from . import db
 
@@ -639,41 +644,53 @@ def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDete
 
 
 def test_gemini_connection(model: str | None = None) -> dict:
-    """Send one tiny request to prove key + model work. Never raises."""
+    """Prove the configured ad detector works. OpenCode unless model is gemini-*."""
+    use_model = (model or "").strip() or gemini_model()
     try:
-        use_model = (model or "").strip() or gemini_model()
-        if use_model.startswith("opencode") or is_opencode_available():
+        if is_gemini_model(use_model):
+            api_key = resolve_gemini_api_key()
+            if not api_key:
+                return {
+                    "ok": False,
+                    "provider": "gemini",
+                    "model": use_model,
+                    "error": "No Gemini API key. OpenCode is the default detector — a gemini-* model is the only thing that uses this key.",
+                }
             start = time.monotonic()
-            raw = opencode_generate(
-                'Return ONLY valid JSON: {"ads": []}',
-                model=use_model if use_model.startswith("opencode") else None,
-            )
+            raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
             parsed = _extract_ads_payload(raw)
             ms = int((time.monotonic() - start) * 1000)
             return {
                 "ok": True,
-                "provider": "opencode",
+                "provider": "gemini",
                 "model": use_model,
                 "ms": ms,
                 "ranges": len(parsed),
             }
-        api_key = resolve_gemini_api_key()
-        if not api_key:
-            return {"ok": False, "error": "No OpenCode CLI or Gemini API key available."}
+        if not is_opencode_available():
+            return {
+                "ok": False,
+                "provider": "opencode",
+                "model": use_model,
+                "error": "OpenCode CLI not found. Install opencode, then Test again.",
+            }
         start = time.monotonic()
-        raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
+        raw = opencode_generate(
+            'Return ONLY valid JSON: {"ads": []}',
+            model=use_model if use_model.startswith("opencode") else None,
+        )
         parsed = _extract_ads_payload(raw)
         ms = int((time.monotonic() - start) * 1000)
         return {
             "ok": True,
-            "provider": "gemini",
+            "provider": "opencode",
             "model": use_model,
             "ms": ms,
             "ranges": len(parsed),
         }
     except Exception as exc:
         logger.warning("Ad-detection test failed: %s", exc)
-        return {"ok": False, "error": str(exc)[-300:]}
+        return {"ok": False, "model": use_model, "error": str(exc)[-300:]}
 
 
 def heuristic_ads(transcript: dict) -> list[Interval]:

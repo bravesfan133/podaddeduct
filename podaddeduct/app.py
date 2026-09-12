@@ -691,6 +691,7 @@ async def save_app_password(request: Request) -> RedirectResponse:
 
 @app.post("/api/gemini-test")
 async def api_gemini_test(request: Request) -> JSONResponse:
+    """Test the configured ad detector. OpenCode unless model is gemini-*."""
     if not _authed(request):
         raise HTTPException(401, "Sign in first.")
     try:

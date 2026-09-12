@@ -500,3 +500,33 @@ def test_parse_timestamp_helpers():
     assert _parse_timestamp("1:30") == 90.0
     assert _parse_timestamp(12.5) == 12.5
     assert _parse_timestamp("bad") is None
+
+
+def test_connection_test_uses_opencode_even_when_gemini_key_exists(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    with (
+        patch.object(seed_mod, "is_opencode_available", return_value=True),
+        patch.object(seed_mod, "opencode_generate", return_value='{"ads": []}'),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-must-not-use"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
+    ):
+        out = seed_mod.test_gemini_connection()
+    assert out["ok"] is True
+    assert out["provider"] == "opencode"
+
+
+def test_connection_test_missing_opencode_does_not_use_gemini_key(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    with (
+        patch.object(seed_mod, "is_opencode_available", return_value=False),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
+    ):
+        out = seed_mod.test_gemini_connection()
+    assert out["ok"] is False
+    assert out["provider"] == "opencode"
+    assert "OpenCode CLI not found" in out["error"]

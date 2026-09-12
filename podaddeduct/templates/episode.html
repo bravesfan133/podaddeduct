@@ -102,17 +102,6 @@
   </div>
   {% endif %}
 
-  {% if not gemini.configured %}
-  <div class="player">
-    <b>One-time setup: Gemini API key</b>
-    <p class="muted">Needed so the app can spot sponsor reads when the publisher didn't mark them. Free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a>. Paste it, then Re-check. Without a key, obvious sponsor-read phrases are still cut.</p>
-    <form method="post" action="/settings/gemini-key">
-      <input name="gemini_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
-      <p><button type="submit">Save key</button></p>
-    </form>
-  </div>
-  {% endif %}
-
   <h2>Skipped sections</h2>
   <ul class="ads" id="chapterList"></ul>
   <p><a href="/chapters/{{ episode.id }}.json" class="muted">chapters data</a></p>

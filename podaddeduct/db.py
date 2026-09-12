@@ -151,6 +151,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ts = pub_ts_for(row["pub_date"])
         if ts > 0:
             conn.execute("UPDATE episodes SET pub_ts = ? WHERE id = ?", (ts, row["id"]))
+    _migrate_opencode_detector(conn)
+
+
+def _migrate_opencode_detector(conn: sqlite3.Connection) -> None:
+    """Drop leftover Gemini Flash defaults so OpenCode is the detector."""
+    flag = conn.execute(
+        "SELECT value FROM kv WHERE key = ?", ("_migrated_opencode_detector",)
+    ).fetchone()
+    if flag:
+        return
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
+    val = ((row["value"] if row else "") or "").strip().lower()
+    if val.startswith("gemini"):
+        conn.execute("DELETE FROM kv WHERE key = ?", ("gemini_model",))
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("_migrated_opencode_detector", "1"),
+    )
 
 
 def init_db() -> None:
@@ -637,7 +656,7 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (Google Gemini Direct Free API / OpenCode CLI)
+    # Ad detection (OpenCode CLI; gemini-* is an optional override)
     "gemini_model": "",
     "opencode_fallback": "",
     # Transcription backend

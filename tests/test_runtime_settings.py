@@ -15,6 +15,16 @@ def _setup(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_migrate_clears_leftover_gemini_model(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    db.set_global_settings({"gemini_model": "gemini-3.6-flash"})
+    with db.connect() as conn:
+        conn.execute("DELETE FROM kv WHERE key = ?", ("_migrated_opencode_detector",))
+    db.init_db()
+    assert db.runtime_str("gemini_model") == settings.gemini_model
+    assert not db.runtime_str("gemini_model").startswith("gemini")
+
+
 def test_kv_overrides_env_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     assert db.models_to_try() == [settings.gemini_model]
@@ -127,18 +137,41 @@ def test_password_set_change_remove(tmp_path, monkeypatch):
         assert client.get("/").status_code == 200
 
 
-def test_gemini_test_reports_no_key(tmp_path, monkeypatch):
+def test_ad_detection_test_defaults_to_opencode(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+    from podaddeduct.app import app
+
+    with (
+        patch.object(seed_mod, "is_opencode_available", return_value=True),
+        patch.object(seed_mod, "opencode_generate", return_value='{"ads": []}'),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-must-not-use"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
+        TestClient(app) as client,
+    ):
+        r = client.post("/api/gemini-test", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["provider"] == "opencode"
+
+
+def test_ad_detection_test_gemini_model_without_key(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
     from podaddeduct.app import app
 
     with (
         patch.object(seed_mod, "resolve_gemini_api_key", return_value=None),
+        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
         TestClient(app) as client,
     ):
-        r = client.post("/api/gemini-test", json={})
+        r = client.post("/api/gemini-test", json={"model": "gemini-2.5-flash"})
         assert r.status_code == 200
-        assert r.json()["ok"] is False
+        body = r.json()
+        assert body["ok"] is False
+        assert body["provider"] == "gemini"
+        assert "Gemini API key" in body["error"]
 
 
 def test_settings_page_renders(tmp_path, monkeypatch):
@@ -148,8 +181,11 @@ def test_settings_page_renders(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.get("/settings")
         assert r.status_code == 200
-        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v", "Gemini"):
+        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v", "OpenCode"):
             assert section in r.text, section
+        assert "adDetectionTest" in r.text
+        assert "geminiTest" not in r.text
+        assert "Test talks to OpenCode" in r.text
 
 
 def test_mutating_routes_need_login(tmp_path, monkeypatch):
