@@ -20,13 +20,15 @@ logger = logging.getLogger("podaddeduct.process")
 
 # In-memory view of what the single worker is doing right now, for
 # logs/health/episode-page. Shape:
-# {"episode_id": int, "stage": str, "started_at": float, "detail": str}
+# {"episode_id": int, "stage": str, "started_at": float, "detail": str,
+#  "done": int | None, "total": int | None}
 _current: dict | None = None
 
 
 def _job_start(episode_id: int) -> None:
     global _current
-    _current = {"episode_id": episode_id, "stage": "queued", "started_at": time.monotonic(), "detail": ""}
+    _current = {"episode_id": episode_id, "stage": "queued", "started_at": time.monotonic(), "detail": "",
+                "done": None, "total": None}
 
 
 def _job_stage(stage: str, detail: str = "") -> None:
@@ -34,12 +36,23 @@ def _job_stage(stage: str, detail: str = "") -> None:
         _current["stage"] = stage
         _current["detail"] = detail
         _current["started_at"] = time.monotonic()
+        if stage != "detecting":
+            _current["done"] = None
+            _current["total"] = None
 
 
 def _job_elapsed() -> float:
     if not _current:
         return 0.0
     return max(0.0, time.monotonic() - _current["started_at"])
+
+
+def _job_progress(done: int, total: int) -> None:
+    """Record fine-grained progress (e.g. ad-detection chunk i of n)."""
+    if _current is not None:
+        _current["done"] = done
+        _current["total"] = total
+        _current["detail"] = f"{done}/{total}"
 
 
 def _job_done(episode_id: int) -> None:
@@ -325,7 +338,7 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     db.update_episode(episode_id, status="working", error="Finding ads…")
     _job_stage("detecting")
     t0 = time.monotonic()
-    zen_ads = find_ads_with_zen(transcript)
+    zen_ads = find_ads_with_zen(transcript, progress_cb=_job_progress)
     logger.info("episode %s ad detection found %d ranges in %.0fs", episode_id, len(zen_ads), time.monotonic() - t0)
     ads = snap_to_silence(zen_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
     ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))

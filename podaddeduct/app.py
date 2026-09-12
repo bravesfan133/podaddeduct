@@ -489,6 +489,11 @@ async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
     job_text = ""
     queue_pos = queue_position(episode_id)
     cur = st.get("current") or {}
+    stage = cur.get("stage") if cur.get("episode_id") == episode_id else ""
+    detail = cur.get("detail", "") if cur.get("episode_id") == episode_id else ""
+    done = cur.get("done") if cur.get("episode_id") == episode_id else None
+    total = cur.get("total") if cur.get("episode_id") == episode_id else None
+    elapsed = round(cur.get("elapsed", 0) or 0, 1) if cur.get("episode_id") == episode_id else 0
     if cur.get("episode_id") == episode_id:
         job_text = describe_job(cur)
         queue_pos = None
@@ -504,6 +509,11 @@ async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
             "error": ep.error,
             "job_text": job_text,
             "queue_position": queue_pos,
+            "stage": stage,
+            "detail": detail,
+            "done": done,
+            "total": total,
+            "elapsed_s": elapsed,
         }
     )
 

@@ -57,7 +57,13 @@
     {% if has_clean %}
     <p class="muted ok" style="margin:0.35rem 0 0">Clean copy — the {{ ranges|length }} marked section(s) below were cut out.</p>
     {% elif episode.status == 'working' %}
-    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — this page refreshes itself, and your podcast app picks up the clean file automatically.</p>
+    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — your podcast app picks up the clean file automatically.</p>
+    <div id="progWrap" style="margin:0.6rem 0 0.2rem;display:none">
+      <div style="height:8px;border-radius:4px;background:var(--inset,#222);overflow:hidden">
+        <div id="progBar" style="height:100%;width:0%;border-radius:4px;background:var(--accent,#6db3f2);transition:width .4s"></div>
+      </div>
+      <p class="muted" id="progText" style="margin:0.3rem 0 0;font-size:0.85rem"></p>
+    </div>
     <p class="muted" id="liveStatus" style="margin:0.35rem 0 0"></p>
     {% elif episode.status == 'error' %}
     <p class="muted" style="margin:0.35rem 0 0">Last attempt failed — see above, then press Prepare to retry.</p>
@@ -124,14 +130,47 @@ async function loadChapters() {
     const res = await fetch('/chapters/{{ episode.id }}.json');
     render((await res.json()).chapters || []);
   } catch (e) {}
+const initialStatus = '{{ episode.status }}';
+async function pollStatus() {
   try {
     const s = await (await fetch('/api/episodes/{{ episode.id }}/status')).json();
     const live = document.getElementById('liveStatus');
     if (live && s.job_text) live.textContent = s.job_text;
-    if (s.status === 'working') setTimeout(() => location.reload(), 8000);
-    else if (s.status === 'ready' && !{% if has_audio %}true{% else %}false{% endif %}) setTimeout(() => location.reload(), 4000);
+    const wrap = document.getElementById('progWrap');
+    const bar = document.getElementById('progBar');
+    const ptext = document.getElementById('progText');
+    if (wrap && s.status === 'working') {
+      let pct = null, label = s.job_text || 'Working…';
+      if (s.total && s.done != null && s.total > 0) {
+        pct = Math.max(0, Math.min(100, Math.round(100 * s.done / s.total)));
+        label = `Detecting ads — chunk ${s.done} of ${s.total}`;
+        if (s.elapsed_s && s.done > 0) {
+          const rate = s.elapsed_s / s.done;
+          const left = Math.max(0, Math.round(rate * (s.total - s.done)));
+          label += ` · ≈${fmt(left)} left`;
+        }
+      } else if (s.elapsed_s) {
+        label = (s.job_text || 'Working…') + ` · ${fmt(Math.round(s.elapsed_s))} elapsed`;
+      }
+      if (pct != null && bar) {
+        wrap.style.display = '';
+        bar.style.width = pct + '%';
+      } else if (wrap && bar) {
+        wrap.style.display = '';
+        bar.style.width = '100%';
+        bar.style.opacity = '0.35';
+      }
+      if (ptext) ptext.textContent = label;
+      if (live) live.textContent = '';
+    }
+    if (s.status !== initialStatus) {
+      location.reload();
+      return;
+    }
   } catch (e) {}
+  setTimeout(pollStatus, 2500);
 }
+if (initialStatus === 'working' || initialStatus === 'pending') pollStatus();
 if (player) player.addEventListener('timeupdate', () => {
   {% if has_clean %}return;{% endif %}
   if (!chapters.length) return;

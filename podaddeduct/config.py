@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     zen_model: str = "muse-spark-1.3-contributor-free"
     zen_fallback_model: str = "deepseek-v4-flash-free"
     zen_auth_path: str = "~/.local/share/opencode/auth.json"
-    zen_chunk_chars: int = 12000
+    zen_chunk_chars: int = 6000
     # Ad-detection LLM provider ("groq" or "zen") + Groq chat models.
     llm_provider: str = "groq"
     groq_llm_model: str = "openai/gpt-oss-120b"

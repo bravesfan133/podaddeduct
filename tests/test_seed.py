@@ -111,3 +111,38 @@ def test_find_ads_with_zen_mocked():
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
+
+
+def test_find_ads_progress_callback():
+    from podaddeduct import db as db_mod
+    from podaddeduct import seed as seed_mod
+
+    seen = []
+
+    def fake_responses(provider, api_key, model, user_content):
+        return "[]"
+
+    real_runtime_int = db_mod.runtime_int
+
+    def fake_runtime_int(key, **kwargs):
+        if key == "zen_chunk_chars":
+            return 120
+        return real_runtime_int(key, **kwargs)
+
+    with (
+        patch.object(seed_mod, "ad_provider", return_value="zen"),
+        patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
+        patch.object(seed_mod, "_llm_call", side_effect=fake_responses),
+        patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
+    ):
+        seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT, progress_cb=lambda d, t: seen.append((d, t)))
+    assert seen, "callback never fired"
+    assert [d for d, _ in seen] == list(range(1, len(seen) + 1))
+    assert len({t for _, t in seen}) == 1, "total must be stable across chunks"
+
+
+def test_default_chunk_chars_fit_rate_limit():
+    from podaddeduct.config import Settings
+
+    default = Settings.model_fields["zen_chunk_chars"].default
+    assert default <= 6000, f"default {default} chars risks TPM 429s on every request"

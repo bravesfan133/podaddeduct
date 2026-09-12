@@ -438,8 +438,12 @@ def test_zen_connection(model: str | None = None) -> dict:
         return {"ok": False, "error": str(exc)[-300:]}
 
 
-def find_ads_with_zen(transcript: dict) -> list[Interval]:
-    """Run transcript chunks through the configured ad-detection LLM."""
+def find_ads_with_zen(transcript: dict, progress_cb=None) -> list[Interval]:
+    """Run transcript chunks through the configured ad-detection LLM.
+
+    progress_cb, if given, is called as progress_cb(done_1based, total)
+    after each chunk — used for the live progress bar.
+    """
     from . import db
 
     provider = ad_provider()
@@ -501,6 +505,8 @@ def find_ads_with_zen(transcript: dict) -> list[Interval]:
             raise RuntimeError(f"Ad detection failed on chunk {i + 1}: {last_err}")
         for r in parsed:
             all_ranges.append(Interval(float(r["start"]), float(r["end"])))
+        if progress_cb is not None:
+            progress_cb(i + 1, len(chunks))
 
     return merge_intervals(all_ranges, gap=2.0)
 

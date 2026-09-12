@@ -224,3 +224,68 @@ def test_janitor_removes_marker(tmp_path, monkeypatch):
     assert old.audio_path is None
     assert not (tmp_path / "audio" / f"{eps[0]}.bin.complete").exists()
     assert db.get_episode(eps[1]).audio_path is not None
+
+
+def _make_episode():
+    feed = db.create_feed(slug="s-prog", upstream_url="https://example.com/rss", title="S")
+    return db.upsert_episode(feed.id, guid="g1", title="E1",
+                             enclosure_url="https://example.com/e1.mp3", pub_date=None)
+
+
+def test_job_progress_tracks_chunks(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+
+    old = proc_mod._current
+    try:
+        proc_mod._job_start(99)
+        assert proc_mod._current["done"] is None
+        proc_mod._job_progress(3, 10)
+        assert proc_mod._current["done"] == 3
+        assert proc_mod._current["total"] == 10
+        assert proc_mod._current["detail"] == "3/10"
+        proc_mod._job_stage("cutting")
+        assert proc_mod._current["done"] is None
+        assert proc_mod._current["total"] is None
+    finally:
+        proc_mod._current = old
+
+
+def test_status_reports_progress_fields(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+    from podaddeduct.app import app
+
+    ep = _make_episode()
+    old = proc_mod._current
+    try:
+        with TestClient(app) as client:
+            body = client.get(f"/api/episodes/{ep.id}/status").json()
+            for key in ("stage", "detail", "done", "total", "elapsed_s", "job_text", "queue_position"):
+                assert key in body, key
+            proc_mod._job_start(ep.id)
+            proc_mod._job_stage("detecting")
+            proc_mod._job_progress(4, 10)
+            body = client.get(f"/api/episodes/{ep.id}/status").json()
+            assert body["stage"] == "detecting"
+            assert body["done"] == 4
+            assert body["total"] == 10
+            assert body["detail"] == "4/10"
+            assert body["queue_position"] is None
+            assert isinstance(body["elapsed_s"], (int, float))
+    finally:
+        proc_mod._current = old
+
+
+def test_episode_page_has_progress_elements(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct.app import app
+
+    ep = _make_episode()
+    with TestClient(app) as client:
+        db.update_episode(ep.id, status="working")
+        html = client.get(f"/episodes/{ep.id}").text
+        assert 'id="progWrap"' in html
+        assert 'id="progBar"' in html
+        assert 'id="liveStatus"' in html
+        assert "location.reload()" in html  # still reloads on terminal state
