@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ feed.title or feed.slug }} — podaddeduct</title>
+  {% include "_theme_head.html" %}
+  <style>
+    body { max-width:800px; margin:2rem auto; padding:0 1rem; }
+    .linkbox { background:var(--inset); border-radius:8px; padding:0.8rem; margin-top:0.5rem; }
+    button { margin-right:0.5rem; }
+    table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:0.5rem 0.3rem; border-bottom:1px solid var(--line); font-size:0.93rem; vertical-align:top; }
+    label { display:block; font-size:0.85rem; color:var(--muted); margin:0.6rem 0 0.3rem; }
+    input[type=number],select { padding:0.55rem 0.7rem; }
+    .showhead { display:flex; gap:1rem; align-items:center; }
+    .showhead img { width:72px; height:72px; border-radius:12px; }
+    .row { display:flex; gap:1rem; flex-wrap:wrap; align-items:end; }
+  </style>
+</head>
+<body>
+  <div class="toprow">
+    <p style="margin:0"><a href="/">← All shows</a></p>
+    {% include "_theme_toggle.html" %}
+  </div>
+  <div class="showhead">
+    {% if feed.artwork_url %}<img src="{{ feed.artwork_url }}" alt="" />{% endif %}
+    <div><h1 style="margin:0">{{ feed.title or feed.slug }}</h1>
+    <p class="muted" style="margin:0.25rem 0 0">{{ episodes|length }} episodes tracked · oldest delete themselves</p></div>
+  </div>
+
+  <div class="card">
+    <b>Paste this once in Apple Podcasts</b>
+    <div class="linkbox"><code id="feedlink">{{ player_url }}</code></div>
+    <p style="margin:0.6rem 0">
+      <button type="button" id="copy">Copy link</button>
+      <span class="muted">Podcasts → Library → … → Follow a Show by URL → paste</span>
+    </p>
+    <form method="post" action="/shows/{{ feed.slug }}/refresh" style="display:inline">
+      <button type="submit" class="ghost">Check for new episodes</button>
+    </form>
+    <form method="post" action="/shows/{{ feed.slug }}/delete" style="display:inline" onsubmit="return confirm('Remove this show and delete its downloaded files?')">
+      <button type="submit" class="danger">Remove show</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <b>How this show behaves</b>
+    <form method="post" action="/shows/{{ feed.slug }}/settings">
+      <input type="hidden" name="settings_form" value="1" />
+      <div class="row">
+        <div><label><input type="checkbox" name="auto_download" value="1" {% if feed_settings.auto_download %}checked{% endif %} /> Prepare new episodes automatically</label></div>
+        <div><label>Keep latest</label><input type="number" name="keep_last" min="1" max="50" value="{{ feed_settings.keep_last }}" /></div>
+        <div><label>Remove ads by</label>
+          <select name="mode">
+            <option value="cut" {% if feed_settings.mode=='cut' %}selected{% endif %}>Cut them out (recommended)</option>
+            <option value="chapters" {% if feed_settings.mode=='chapters' %}selected{% endif %}>Mark chapters only (uses ~no space)</option>
+          </select>
+        </div>
+      </div>
+      <p><button type="submit">Save</button></p>
+    </form>
+  </div>
+
+  <table>
+    <thead><tr><th>Episode</th><th>Status</th><th>Saved</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td><a href="/episodes/{{ r.ep.id }}">{{ r.ep.title }}</a><br /><span class="muted">{{ r.ep.pub_date or '' }}</span></td>
+        <td>
+          {% if r.ep.status == 'ready' or r.ep.status == 'manual' %}<span class="pill ok">Ready</span>
+          {% elif r.ep.status == 'working' %}<span class="pill warn">Cleaning…</span>
+          {% elif r.ep.status == 'error' %}<span class="pill warn">Needs attention</span>
+          {% else %}<span class="pill">New</span>{% endif %}
+        </td>
+        <td class="muted">{% if r.ads %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3" class="muted">No episodes yet — press “Check for new episodes”.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+<script>
+document.getElementById('copy').addEventListener('click', async (e) => {
+  await navigator.clipboard.writeText(document.getElementById('feedlink').textContent.trim());
+  e.target.textContent = 'Copied ✓';
+  setTimeout(() => e.target.textContent = 'Copy link', 1200);
+});
+</script>
+</body>
+</html>

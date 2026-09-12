@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ episode.title }} — podaddeduct</title>
+  {% include "_theme_head.html" %}
+  <style>
+    body { max-width:720px; margin:2rem auto; padding:0 1rem; }
+    audio { width:100%; margin:0.75rem 0; }
+    .pill { font-size:0.85rem; padding:0.2rem 0.7rem; }
+    ul.ads li { color:var(--err); }
+    textarea { width:100%; min-height:80px; font-family:monospace; }
+    input[type=password] { width:100%; max-width:420px; }
+  </style>
+</head>
+<body>
+  <div class="toprow">
+    <p style="margin:0"><a href="/shows/{{ feed.slug if feed else '' }}">← {{ feed.title if feed else 'Show' }}</a></p>
+    {% include "_theme_toggle.html" %}
+  </div>
+  <h1>{{ episode.title }}</h1>
+  <p class="muted" id="statusline">
+    {% if episode.status == 'ready' or episode.status == 'manual' %}
+      <span class="pill ok">Ready — ads removed</span>
+    {% elif episode.status == 'working' %}
+      <span class="pill warn">Cleaning… this page refreshes itself</span>
+    {% elif episode.status == 'error' %}
+      <span class="pill warn">Needs attention</span>
+    {% else %}
+      <span class="pill">New — press Prepare below</span>
+    {% endif %}
+    {% if saved_seconds %}&nbsp;·&nbsp;{{ '%d:%02d'|format(saved_seconds//60, saved_seconds%60) }} of ads skipped{% endif %}
+  </p>
+  {% if episode.error and episode.status == 'error' %}<p class="err">{{ episode.error }}</p>{% endif %}
+  {% if key_saved %}<p class="muted ok">Key saved — press Re-check.</p>{% endif %}
+
+  {% if not has_audio and episode.status != 'working' %}
+  <div class="player">
+    <b>This episode isn't prepared yet.</b>
+    <p class="muted">Press Prepare — it downloads once, finds the ads, and saves a clean copy. Old episodes delete themselves later.</p>
+    <form method="post" action="/episodes/{{ episode.id }}/recheck">
+      <button type="submit">Prepare this episode</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="player">
+    <b>Listen</b>
+    {% if has_clean %}
+    <p class="muted ok" style="margin:0.35rem 0 0">Clean copy — the {{ ranges|length }} marked section(s) below were cut out.</p>
+    {% elif episode.status == 'working' %}
+    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — playing the original for now. This page refreshes; the clean copy replaces it.</p>
+    {% else %}
+    <p class="muted" style="margin:0.35rem 0 0">Original audio (no ads found, or chapters-only mode).</p>
+    {% endif %}
+    {% if has_audio %}<audio id="player" controls preload="metadata" src="/audio/{{ episode.id }}"></audio>{% endif %}
+    <p class="muted" id="nowPlaying" style="margin-bottom:0"></p>
+    <form method="post" action="/episodes/{{ episode.id }}/recheck" style="margin-top:0.75rem">
+      <button class="ghost" type="submit">Re-check for ads</button>
+    </form>
+  </div>
+  {% endif %}
+
+  {% if not zen.configured %}
+  <div class="player">
+    <b>One-time setup: ad-detection key</b>
+    <p class="muted">Needed so the app can spot sponsor reads. <a href="https://opencode.ai/auth" target="_blank" rel="noopener">Get a key</a>, paste it, then Re-check.</p>
+    <form method="post" action="/settings/zen-key">
+      <input name="zen_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
+      <p><button type="submit">Save key</button></p>
+    </form>
+  </div>
+  {% endif %}
+
+  <h2>Skipped sections</h2>
+  <ul class="ads" id="chapterList"></ul>
+  <p><a href="/chapters/{{ episode.id }}.json" class="muted">chapters data</a></p>
+
+  <details class="muted" style="margin-top:2rem">
+    <summary>Fix marks by hand (rarely needed)</summary>
+    <p>One per line, in seconds: <code>12.5-34.0</code></p>
+    <form method="post" action="/episodes/{{ episode.id }}/ranges">
+      <textarea name="ranges_text">{{ ranges_text }}</textarea>
+      <p><button type="submit">Save marks</button></p>
+    </form>
+  </details>
+
+<script>
+const SKIP = new Set(['ad', 'sponsor']);
+const player = document.getElementById('player');
+const nowPlaying = document.getElementById('nowPlaying');
+const list = document.getElementById('chapterList');
+let chapters = [];
+function fmt(t) { const s = Math.max(0, Math.floor(t)); return ((s/60)|0) + ':' + String(s%60).padStart(2,'0'); }
+function render(chs) {
+  chapters = chs || [];
+  list.innerHTML = '';
+  const ads = chapters.filter(c => SKIP.has((c.title||'').toLowerCase()));
+  if (!ads.length) {
+    list.innerHTML = '<li class="muted">None found yet.</li>';
+    if (nowPlaying) nowPlaying.textContent = '';
+    return;
+  }
+  for (const ch of ads) {
+    const li = document.createElement('li');
+    li.textContent = `Skipped ${fmt(ch.startTime)} – ${fmt(ch.endTime)}`;
+    list.appendChild(li);
+  }
+  if (nowPlaying) nowPlaying.textContent = {% if has_clean %}`{{ ranges|length }} section(s) already cut from this file`{% else %}`{{ ranges|length }} section(s) will auto-skip while playing`{% endif %};
+}
+async function loadChapters() {
+  try {
+    const res = await fetch('/chapters/{{ episode.id }}.json');
+    render((await res.json()).chapters || []);
+  } catch (e) {}
+  try {
+    const s = await (await fetch('/api/episodes/{{ episode.id }}/status')).json();
+    if (s.status === 'working') setTimeout(() => location.reload(), 6000);
+    else if (s.status === 'ready' && !{% if has_audio %}true{% else %}false{% endif %}) setTimeout(() => location.reload(), 4000);
+  } catch (e) {}
+}
+if (player) player.addEventListener('timeupdate', () => {
+  {% if has_clean %}return;{% endif %}
+  if (!chapters.length) return;
+  const t = player.currentTime;
+  for (const ch of chapters) {
+    if (!SKIP.has((ch.title||'').toLowerCase())) continue;
+    const start = Number(ch.startTime)||0, end = Number(ch.endTime != null ? ch.endTime : start);
+    if (t >= start && t < end - 0.15) { player.currentTime = end; break; }
+  }
+});
+loadChapters();
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+<div class="themebar" role="group" aria-label="Appearance">
+  <div class="theme-switch">
+    <button type="button" data-theme-btn="system" aria-pressed="true">System</button>
+    <button type="button" data-theme-btn="light" aria-pressed="false">Light</button>
+    <button type="button" data-theme-btn="dark" aria-pressed="false">Dark</button>
+  </div>
+</div>
+<script src="{{ request.url_for('static', path='theme.js') }}" defer></script>
