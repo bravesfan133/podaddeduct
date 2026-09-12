@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from .config import settings
+from . import db as _db
 
 _SECRETS_NAME = "secrets.json"
 
@@ -50,6 +51,27 @@ def set_zen_api_key(key: str | None) -> None:
     save_secrets({"zen_api_key": key or None})
 
 
+def get_app_password() -> str:
+    """Effective family password: UI value wins ("" disables), else env."""
+    data = load_secrets()
+    if "app_password" in data:
+        return str(data.get("app_password") or "")
+    return str(settings.app_password or "")
+
+
+def password_source() -> str | None:
+    data = load_secrets()
+    if "app_password" in data:
+        return "ui" if data.get("app_password") else None
+    if settings.app_password:
+        return "env"
+    return None
+
+
+def set_app_password(value: str) -> None:
+    save_secrets({"app_password": value})
+
+
 def zen_key_status() -> dict:
     """Safe status for UI — never returns the raw key."""
     stored = get_zen_api_key()
@@ -82,5 +104,5 @@ def zen_key_status() -> dict:
         "configured": bool(stored or env or auth_fallback),
         "source": source,
         "hint": hint,
-        "model": settings.zen_model,
+        "model": _db.runtime_str("zen_model"),
     }

@@ -106,7 +106,7 @@ def rewrite_feed_xml(
         href = escape(image_href)
         image = f"<itunes:image href=\"{href}\"/>\n    <image><url>{href}</url></image>"
 
-    limit = item_limit if item_limit is not None else settings.feed_item_limit
+    limit = item_limit if item_limit is not None else db.runtime_int("feed_item_limit", minimum=1, maximum=500)
     entries = list(parsed.entries[: max(1, limit)])
 
     items: list[str] = []

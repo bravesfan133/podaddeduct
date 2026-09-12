@@ -155,7 +155,9 @@ def _zen_via_opencode_cli(user_content: str, *, model: str | None = None) -> str
 
 def _zen_responses(api_key: str, model: str, user_content: str) -> str:
     """Call Zen Responses API (chat/completions returns 500 for muse-spark free)."""
-    url = settings.zen_base_url.rstrip("/") + "/responses"
+    from . import db
+
+    url = db.runtime_str("zen_base_url").rstrip("/") + "/responses"
     # Prefer messages-shaped input so the system prompt stays separate.
     payload = {
         "model": model,
@@ -199,7 +201,9 @@ def _zen_responses(api_key: str, model: str, user_content: str) -> str:
 
 def _zen_chat_completions(api_key: str, model: str, user_content: str) -> str:
     """Chat Completions path for free models that are not Responses-only."""
-    url = settings.zen_base_url.rstrip("/") + "/chat/completions"
+    from . import db
+
+    url = db.runtime_str("zen_base_url").rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
         "temperature": 0.1,
@@ -239,8 +243,74 @@ def _zen_call(api_key: str, model: str, user_content: str) -> str:
     return _zen_chat_completions(api_key, model, user_content)
 
 
+CURATED_ZEN_MODELS = [
+    "muse-spark-1.3-contributor-free",
+    "deepseek-v4-flash-free",
+]
+
+
+def fetch_zen_models() -> dict:
+    """List model ids from the Zen API using the resolved key.
+
+    Returns {"models": [...], "live": True} or {"models": curated, "live": False}.
+    Never raises — the UI must work before any key is configured.
+    """
+    from . import db
+
+    api_key = resolve_zen_api_key()
+    base = (db.runtime_str("zen_base_url") or "").rstrip("/")
+    if not api_key or not base:
+        return {"models": list(CURATED_ZEN_MODELS), "live": False}
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(
+                base + "/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        ids: list[str] = []
+        items = data.get("data") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                mid = item.get("id") if isinstance(item, dict) else None
+                if mid and mid not in ids:
+                    ids.append(str(mid))
+        if not ids:
+            return {"models": list(CURATED_ZEN_MODELS), "live": False}
+        return {"models": sorted(ids)[:200], "live": True}
+    except Exception as exc:
+        logger.warning("Zen /models failed, using curated list: %s", exc)
+        return {"models": list(CURATED_ZEN_MODELS), "live": False}
+
+
+def test_zen_connection(model: str | None = None) -> dict:
+    """Send one tiny request to prove key + model work. Never raises."""
+    from . import db
+
+    try:
+        api_key = resolve_zen_api_key()
+        if not api_key:
+            return {"ok": False, "error": "No API key saved yet."}
+        use_model = (model or "").strip() or (db.models_to_try() + [""])[0]
+        if not use_model:
+            return {"ok": False, "error": "No model selected."}
+        import time
+
+        start = time.monotonic()
+        raw = _zen_call(api_key, use_model, "Return exactly: []")
+        parsed = _extract_json_array(raw)
+        ms = int((time.monotonic() - start) * 1000)
+        return {"ok": True, "model": use_model, "ms": ms, "ranges": len(parsed)}
+    except Exception as exc:
+        logger.warning("Zen test failed: %s", exc)
+        return {"ok": False, "error": str(exc)[-300:]}
+
+
 def find_ads_with_zen(transcript: dict) -> list[Interval]:
     """Call Zen free models on transcript chunks; merge all ad ranges."""
+    from . import db
+
     api_key = resolve_zen_api_key()
     if not api_key:
         raise RuntimeError(
@@ -249,11 +319,11 @@ def find_ads_with_zen(transcript: dict) -> list[Interval]:
             "(Muse Spark 1.3 Free) via POST /zen/v1/responses, with OpenCode CLI fallback."
         )
 
-    chunks = chunk_transcript_lines(transcript, max_chars=settings.zen_chunk_chars)
+    chunks = chunk_transcript_lines(transcript, max_chars=db.runtime_int("zen_chunk_chars", minimum=1000))
     if not chunks:
         return []
 
-    models = settings.zen_models_to_try()
+    models = db.models_to_try()
 
     all_ranges: list[Interval] = []
     for i, chunk in enumerate(chunks):
@@ -332,12 +402,14 @@ def snap_to_silence(
 
     snapped: list[Interval] = []
     duration = len(pcm) / float(sr)
+    from . import db as _db
+
     for r in ranges:
         start = nearest_valley(r.start, "before")
         end = nearest_valley(r.end, "after")
         start = max(0.0, min(start, duration))
         end = max(0.0, min(end, duration))
-        if end - start >= settings.min_ad_seconds * 0.5:
+        if end - start >= _db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5:
             snapped.append(Interval(start, end))
     return merge_intervals(snapped, gap=1.5)
 
@@ -350,5 +422,7 @@ def union_ranges(*groups: list[Interval]) -> list[Interval]:
 
 
 def filter_min_duration(ranges: list[Interval], min_seconds: float | None = None) -> list[Interval]:
-    floor = settings.min_ad_seconds if min_seconds is None else min_seconds
+    from . import db as _db
+
+    floor = _db.runtime_float("min_ad_seconds", minimum=1.0) if min_seconds is None else min_seconds
     return [r for r in ranges if r.duration >= floor]

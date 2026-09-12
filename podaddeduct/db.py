@@ -402,12 +402,56 @@ def delete_feed(feed_id: int) -> None:
 
 
 # --- Global settings (tiny kv store) ---
+#
+# Precedence for every runtime setting: UI value (kv) > environment (.env)
+# > code default (config.Settings). Empty kv value ("") means "inherit".
+# Only HOST/PORT/DATA_DIR stay env-only (they bind before the app runs).
 
 GLOBAL_DEFAULTS: dict[str, str] = {
     "max_cache_gb": "3.0",
     "keep_last_n": "5",
     "delete_after_days": "14",
     "poll_minutes": "30",
+    # Server / sharing
+    "public_base_url": "",
+    # Processing
+    "process_recent": "",
+    "feed_item_limit": "",
+    "min_ad_seconds": "",
+    "silence_snap_window": "",
+    "delete_original_after_cut": "",
+    "auto_prepare_latest": "",
+    # Ad detection (OpenCode Zen)
+    "zen_model": "",
+    "zen_fallback_model": "",
+    "zen_base_url": "",
+    "zen_chunk_chars": "",
+    # Transcription backend
+    "stt_python": "",
+    "stt_sidecar": "",
+    "stt_model": "",
+}
+
+# kv key -> Settings attribute used when kv is empty (env-then-default).
+_RUNTIME_ATTRS: dict[str, str] = {
+    "max_cache_gb": "max_cache_gb",
+    "keep_last_n": "keep_last_n",
+    "delete_after_days": "delete_after_days",
+    "poll_minutes": "poll_minutes",
+    "public_base_url": "public_base_url",
+    "process_recent": "process_recent",
+    "feed_item_limit": "feed_item_limit",
+    "min_ad_seconds": "min_ad_seconds",
+    "silence_snap_window": "silence_snap_window",
+    "delete_original_after_cut": "delete_original_after_cut",
+    "auto_prepare_latest": "auto_prepare_latest",
+    "zen_model": "zen_model",
+    "zen_fallback_model": "zen_fallback_model",
+    "zen_base_url": "zen_base_url",
+    "zen_chunk_chars": "zen_chunk_chars",
+    "stt_python": "stt_python",
+    "stt_sidecar": "stt_sidecar",
+    "stt_model": "stt_model",
 }
 
 
@@ -434,6 +478,77 @@ def set_global_settings(updates: dict[str, str]) -> dict[str, str]:
                     (k, str(v)),
                 )
     return get_global_settings()
+
+
+def clear_global_settings(keys: list[str]) -> dict[str, str]:
+    """Reset keys to inherit (env-then-default) by removing kv overrides."""
+    with connect() as conn:
+        for k in keys:
+            if k in GLOBAL_DEFAULTS:
+                conn.execute("DELETE FROM kv WHERE key = ?", (k,))
+    return get_global_settings()
+
+
+def _env_fallback(key: str) -> str:
+    attr = _RUNTIME_ATTRS.get(key)
+    if not attr:
+        return ""
+    val = getattr(settings, attr, "")
+    return "" if val is None else str(val)
+
+
+def runtime_str(key: str) -> str:
+    """Effective string value: UI (kv) wins, then env, then code default."""
+    if key in GLOBAL_DEFAULTS:
+        with connect() as conn:
+            row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        if row and (row["value"] or "").strip():
+            return str(row["value"]).strip()
+    return _env_fallback(key).strip()
+
+
+def runtime_int(key: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        val = int(float(runtime_str(key)))
+    except ValueError:
+        val = 0
+    if minimum is not None:
+        val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
+def runtime_float(key: str, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        val = float(runtime_str(key))
+    except ValueError:
+        val = 0.0
+    if minimum is not None:
+        val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
+def runtime_bool(key: str) -> bool:
+    raw = runtime_str(key).lower()
+    if raw in {"1", "true", "on", "yes"}:
+        return True
+    if raw in {"0", "false", "off", "no"}:
+        return False
+    attr = _RUNTIME_ATTRS.get(key)
+    return bool(getattr(settings, attr, False))
+
+
+def models_to_try() -> list[str]:
+    """Effective (primary, fallback) Zen models: UI wins over env/default."""
+    ordered: list[str] = []
+    for key in ("zen_model", "zen_fallback_model"):
+        mid = runtime_str(key).strip()
+        if mid and mid not in ordered:
+            ordered.append(mid)
+    return ordered
 
 
 # --- Storage ---

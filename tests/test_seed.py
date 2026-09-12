@@ -84,6 +84,7 @@ def test_extract_response_text():
 
 
 def test_find_ads_with_zen_mocked():
+    from podaddeduct import db as db_mod
     from podaddeduct import seed as seed_mod
 
     def fake_responses(api_key, model, user_content):
@@ -93,10 +94,17 @@ def test_find_ads_with_zen_mocked():
             return '[{"start": 400.0, "end": 445.0}]'
         return "[]"
 
+    real_runtime_int = db_mod.runtime_int
+
+    def fake_runtime_int(key, **kwargs):
+        if key == "zen_chunk_chars":
+            return 120
+        return real_runtime_int(key, **kwargs)
+
     with (
         patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
         patch.object(seed_mod, "_zen_call", side_effect=fake_responses),
-        patch.object(seed_mod.settings, "zen_chunk_chars", 120),
+        patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
     ):
         ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
     assert len(ads) >= 2

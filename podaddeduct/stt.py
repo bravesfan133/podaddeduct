@@ -81,26 +81,29 @@ def _audio_for_stt(audio_path: Path) -> Path:
 
 
 def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> dict:
-    """Run Parakeet sidecar (or return cached transcript)."""
+    """Run the configured STT sidecar (or return cached transcript)."""
     if dest.exists() and not force:
         cached = load_transcript(dest)
         if cached and cached.get("sentences") is not None:
             logger.info("using cached transcript %s", dest)
             return cached
 
-    python = Path(settings.stt_python)
-    script = Path(settings.stt_sidecar)
+    from . import db
+
+    python = Path(db.runtime_str("stt_python"))
+    script = Path(db.runtime_str("stt_sidecar"))
+    model = db.runtime_str("stt_model")
     if not python.exists():
         raise RuntimeError(
-            f"STT python not found at {python}. Create .venv-stt with: "
-            "python3.12 -m venv .venv-stt && .venv-stt/bin/pip install parakeet-mlx"
+            f"Transcription tool not found at {python}. "
+            "Pick a transcription backend on the home page (Server settings)."
         )
     if not script.exists():
-        raise RuntimeError(f"STT sidecar missing: {script}")
+        raise RuntimeError(f"Transcription script missing: {script}")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     stt_audio = _audio_for_stt(audio_path)
-    cmd = [str(python), str(script), str(stt_audio), str(dest), settings.stt_model]
+    cmd = [str(python), str(script), str(stt_audio), str(dest), model]
     logger.info("STT sidecar: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd,

@@ -5,15 +5,16 @@ services:
     build: .
     image: podaddeduct:local
     ports:
-      - "8080:8080"
+      - "7887:7887"
     env_file:
       - path: .env
         required: false
     environment:
       DATA_DIR: /data
       HOST: 0.0.0.0
-      PORT: 8080
-      # Linux transcription (N100-friendly). Override in .env if needed.
+      PORT: 7887
+      # Container defaults for Linux transcription (N100-friendly).
+      # The home-page Server settings override these at runtime.
       STT_PYTHON: python
       STT_SIDECAR: ./scripts/stt_faster.py
       STT_MODEL: base

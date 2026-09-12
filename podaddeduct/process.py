@@ -156,8 +156,8 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     transcript = transcribe_audio(audio_path, transcript_path_for(episode_id), force=False)
     db.update_episode(episode_id, status="working", error="Finding ads…")
     zen_ads = find_ads_with_zen(transcript)
-    ads = snap_to_silence(zen_ads, pcm, sr, window=settings.silence_snap_window)
-    ads = filter_min_duration(ads, min_seconds=max(3.0, settings.min_ad_seconds * 0.5))
+    ads = snap_to_silence(zen_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
+    ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
 
     if mode == "chapters":
         from .chapters import intervals_to_dicts
@@ -216,7 +216,7 @@ def _finalize(
         fields["size_bytes"] = _file_size(audio_path)
 
     # Cache, not archive: drop the big original once the clean file exists.
-    if fields.get("clean_audio_path") and settings.delete_original_after_cut:
+    if fields.get("clean_audio_path") and db.runtime_bool("delete_original_after_cut"):
         try:
             Path(audio_path).unlink(missing_ok=True)
             fields["audio_path"] = None

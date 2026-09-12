@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings — podaddeduct</title>
+  {% include "_theme_head.html" %}
+  <style>
+    main { max-width:760px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+    h1 { font-size:1.7rem; margin:0 0 0.25rem; }
+    h2 { font-size:1.1rem; margin:0 0 0.75rem; }
+    p.sub { color:var(--muted); margin-top:0; line-height:1.5; }
+    label { display:block; font-size:0.85rem; color:var(--muted); margin:0.6rem 0 0.3rem; }
+    input[type=text],input[type=password],input[type=number],select { width:100%; }
+    input[type=checkbox] { transform:scale(1.2); margin-right:0.4rem; }
+    button { margin-top:0.75rem; margin-right:0.5rem; }
+    button.ghost { background:var(--ghost-bg); color:var(--fg); font-weight:400; }
+    .bar { height:10px; background:var(--inset); border-radius:99px; overflow:hidden; margin-top:0.5rem; }
+    .bar > div { height:100%; background:var(--accent); }
+    .row { display:flex; gap:0.75rem; flex-wrap:wrap; } .row > div { flex:1; min-width:140px; }
+    .navlink { font-size:0.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="toprow">
+    <a class="navlink" href="/">← Shows</a>
+    {% include "_theme_toggle.html" %}
+  </div>
+  <h1>Settings</h1>
+  <p class="sub">Everything here saves on this server. Empty fields mean "use the built-in default".</p>
+  {% if settings_error %}<div class="card"><p class="warn" style="margin:0">{{ settings_error }}</p></div>{% endif %}
+
+  <div class="card">
+    <h2>Storage — small by design</h2>
+    <p class="sub" style="margin:0">Using {{ '%.1f'|format(storage.bytes/1024**3) }} GB of {{ '%.1f'|format(storage.limit_bytes/1024**3) }} GB. Oldest episodes delete themselves first. Originals are deleted after cleaning.</p>
+    <div class="bar"><div style="width:{{ [storage_pct,100]|min }}%"></div></div>
+    <form method="post" action="/settings/global">
+      <div class="row">
+        <div><label>Max storage (GB)</label><input name="max_cache_gb" type="number" step="0.5" min="0.5" max="50" value="{{ global_settings.max_cache_gb }}" /></div>
+        <div><label>Keep latest (per show)</label><input name="keep_last_n" type="number" min="1" max="50" value="{{ global_settings.keep_last_n }}" /></div>
+        <div><label>Delete after (days)</label><input name="delete_after_days" type="number" min="1" max="365" value="{{ global_settings.delete_after_days }}" /></div>
+        <div><label>Check for new (minutes)</label><input name="poll_minutes" type="number" min="5" max="1440" value="{{ global_settings.poll_minutes }}" /></div>
+      </div>
+      <button type="submit">Save</button>
+      {% if saved == 'settings' %}<span class="ok">Saved.</span>{% endif %}
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Ad detection</h2>
+    <p class="sub">The app transcribes each episode, then this AI spots the sponsor reads. {% if zen.configured %}<span class="ok">Connected ({{ zen.source }}).</span>{% else %}<span class="warn">Not connected yet.</span>{% endif %}</p>
+    {% if saved == 'zen' %}<p class="ok">Key saved.</p>{% endif %}
+    <form method="post" action="/settings/zen-key">
+      <label>API key</label>
+      <input name="zen_api_key" type="password" autocomplete="off" placeholder="{% if zen.configured %}Saved ({{ zen.hint }}) — paste to replace{% else %}Paste key…{% endif %}" />
+      <button type="submit">Save key</button>
+      <button type="submit" name="clear" value="1" class="ghost">Remove</button>
+    </form>
+    <form method="post" action="/settings/global">
+      <input type="hidden" name="settings_form" value="1" />
+      <div class="row">
+        <div><label>Main model</label><input name="zen_model" type="text" list="zen-models" value="{{ global_settings.zen_model }}" placeholder="{{ effective.zen_model }}" /></div>
+        <div><label>Backup model</label><input name="zen_fallback_model" type="text" list="zen-models" value="{{ global_settings.zen_fallback_model }}" placeholder="{{ effective.zen_fallback_model }}" /></div>
+      </div>
+      <datalist id="zen-models"></datalist>
+      <p class="sub" id="zen-models-note" style="font-size:0.8rem"></p>
+      <div class="row">
+        <div><label>Transcript chunk size</label><input name="zen_chunk_chars" type="number" min="1000" max="1000000" value="{{ global_settings.zen_chunk_chars }}" placeholder="{{ effective.zen_chunk_chars }}" /></div>
+      </div>
+      <button type="submit">Save</button>
+      <button type="button" id="zenTest" class="ghost">Test key + model</button>
+      <span id="zenTestOut" class="sub" style="font-size:0.85rem"></span>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Processing</h2>
+    <form method="post" action="/settings/global">
+      <input type="hidden" name="settings_form" value="1" />
+      <div class="row">
+        <div><label>Prepare at once (episodes)</label><input name="process_recent" type="number" min="1" max="20" value="{{ global_settings.process_recent }}" placeholder="{{ effective.process_recent }}" /></div>
+        <div><label>Episodes per feed</label><input name="feed_item_limit" type="number" min="1" max="500" value="{{ global_settings.feed_item_limit }}" placeholder="{{ effective.feed_item_limit }}" /></div>
+        <div><label>Shortest ad to cut (sec)</label><input name="min_ad_seconds" type="number" step="0.5" min="1" max="300" value="{{ global_settings.min_ad_seconds }}" placeholder="{{ effective.min_ad_seconds }}" /></div>
+      </div>
+      <div class="row">
+        <div><label><input type="checkbox" name="auto_prepare_latest" value="1" {% if effective.auto_prepare_latest %}checked{% endif %} /> Prepare new episodes automatically</label></div>
+        <div><label><input type="checkbox" name="delete_original_after_cut" value="1" {% if effective.delete_original_after_cut %}checked{% endif %} /> Delete originals after cutting</label></div>
+      </div>
+      <button type="submit">Save</button>
+      {% if saved == 'settings' %}<span class="ok">Saved.</span>{% endif %}
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Server</h2>
+    <form method="post" action="/settings/global">
+      <input type="hidden" name="settings_form" value="1" />
+      <div><label>Public address (for Overcast — empty = auto)</label><input name="public_base_url" type="text" value="{{ global_settings.public_base_url }}" placeholder=https://podcasts.example.com (now: {{ effective.public_base_url or public_base }}) /></div>
+      <div class="row">
+        <div><label>Transcription backend</label>
+          <select id="stt_backend">
+            <option value="parakeet">Mac — Parakeet (Apple Silicon)</option>
+            <option value="faster">Linux / server — faster-whisper (CPU)</option>
+            <option value="custom">Custom paths…</option>
+          </select>
+        </div>
+        <div><label>Transcription model</label><input name="stt_model" id="stt_model" type="text" value="{{ global_settings.stt_model }}" placeholder="{{ effective.stt_model }}" /></div>
+      </div>
+      <div class="row">
+        <div><label>Transcription tool</label><input name="stt_python" type="text" value="{{ global_settings.stt_python }}" placeholder="{{ effective.stt_python }}" /></div>
+        <div><label>Transcription script</label><input name="stt_sidecar" id="stt_sidecar" type="text" value="{{ global_settings.stt_sidecar }}" placeholder="{{ effective.stt_sidecar }}" /></div>
+      </div>
+      <button type="submit">Save</button>
+    </form>
+    <form method="post" action="/settings/password" style="margin-top:1rem">
+      <label>Family password {% if password_set %}<span class="ok">(set{% if password_source == 'env' %} in environment{% endif %})</span>{% else %}<span class="muted">(off — anyone on your network can open this page)</span>{% endif %}</label>
+      {% if password_set %}<input name="current" type="password" autocomplete="off" placeholder="Current password" style="margin-bottom:0.5rem" />{% endif %}
+      <div class="row">
+        <div><input name="new" type="password" autocomplete="new-password" placeholder="New password (empty = remove)" /></div>
+        <div><input name="confirm" type="password" autocomplete="new-password" placeholder="Repeat new password" /></div>
+      </div>
+      <button type="submit">Save password</button>
+      {% if saved == 'password' %}<span class="ok">Saved.</span>{% endif %}
+      {% if saved == 'password-off' %}<span class="ok">Password removed.</span>{% endif %}
+    </form>
+  </div>
+  <p class="sub" style="text-align:center;font-size:0.8rem">podaddeduct v{{ app_version }}</p>
+</main>
+<script>
+// Model list from your key (falls back to a short curated list)
+(async () => {
+  const dl = document.getElementById('zen-models'), note = document.getElementById('zen-models-note');
+  if (!dl) return;
+  try {
+    const r = await fetch('/api/zen-models');
+    const d = await r.json();
+    dl.innerHTML = '';
+    for (const m of (d.models || [])) {
+      const o = document.createElement('option');
+      o.value = m;
+      dl.appendChild(o);
+    }
+    if (note) note.textContent = d.live ? `Showing ${d.models.length} models from your key.` : 'Could not list models from the key — showing common options. You can still type any model id.';
+  } catch (e) {}
+})();
+// Test key + model without processing anything
+const zenTest = document.getElementById('zenTest');
+if (zenTest) zenTest.addEventListener('click', async () => {
+  const out = document.getElementById('zenTestOut');
+  out.textContent = 'Testing…';
+  try {
+    const r = await fetch('/api/zen-test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json();
+    out.textContent = d.ok ? `Works ✓ (${d.model}, ${d.ms}ms)` : `Failed: ${d.error || 'unknown error'}`;
+  } catch (e) { out.textContent = 'Failed: no response'; }
+});
+// Transcription backend shortcut fills the paths below
+const BACKENDS = {
+  parakeet: {python: './.venv-stt/bin/python', sidecar: './scripts/stt_sidecar.py', model: 'mlx-community/parakeet-tdt-0.6b-v3'},
+  faster: {python: 'python', sidecar: './scripts/stt_faster.py', model: 'base'},
+};
+const backendSel = document.getElementById('stt_backend'), sidecarIn = document.getElementById('stt_sidecar'), modelIn = document.getElementById('stt_model');
+function pickBackend() {
+  if (!backendSel) return;
+  const cur = (sidecarIn && sidecarIn.value) || (sidecarIn && sidecarIn.placeholder) || '';
+  if (cur.includes('stt_faster')) backendSel.value = 'faster';
+  else if (cur.includes('stt_sidecar')) backendSel.value = 'parakeet';
+  else backendSel.value = 'custom';
+}
+if (backendSel) {
+  pickBackend();
+  backendSel.addEventListener('change', () => {
+    const b = BACKENDS[backendSel.value];
+    if (!b) return;
+    document.querySelector('[name=stt_python]').value = b.python;
+    sidecarIn.value = b.sidecar;
+    modelIn.value = b.model;
+  });
+}
+</script>
+</body>
+</html>

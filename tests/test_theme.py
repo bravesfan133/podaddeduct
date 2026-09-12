@@ -19,7 +19,7 @@ def test_theme_static_served():
 
 def test_pages_offer_system_light_dark():
     with TestClient(app) as client:
-        paths = ["/", "/login"]
+        paths = ["/", "/login", "/settings"]
         feeds = db.list_feeds()
         if feeds:
             paths.append(f"/shows/{feeds[0].slug}")

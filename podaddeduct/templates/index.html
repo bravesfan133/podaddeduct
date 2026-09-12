@@ -11,9 +11,9 @@
     h2 { font-size:1.1rem; margin:0 0 0.75rem; }
     p.sub { color:var(--muted); margin-top:0; line-height:1.5; }
     label { display:block; font-size:0.85rem; color:var(--muted); margin:0.6rem 0 0.3rem; }
-    input[type=text],input[type=password],input[type=number],select { width:100%; }
-    input[type=checkbox] { transform:scale(1.2); margin-right:0.4rem; }
+    input[type=text],input[type=password],input[type=number],input[type=file],select { width:100%; }
     button { margin-top:0.75rem; margin-right:0.5rem; }
+    button.ghost { background:var(--ghost-bg); color:var(--fg); font-weight:400; }
     .url { display:block; margin-top:0.5rem; padding:0.7rem; background:var(--inset); border-radius:8px; }
     ul { padding-left:0; list-style:none; }
     .show { display:flex; gap:1rem; align-items:center; padding:0.8rem 0; border-top:1px solid var(--line); }
@@ -26,18 +26,17 @@
     .result { display:flex; gap:0.8rem; align-items:center; padding:0.6rem 0; border-top:1px solid var(--line); }
     .result img { width:48px; height:48px; border-radius:8px; }
     details { margin-top:0.75rem; } summary { cursor:pointer; color:var(--muted); }
-    .row { display:flex; gap:0.75rem; flex-wrap:wrap; } .row > div { flex:1; min-width:140px; }
+    .navlink { font-size:0.9rem; }
   </style>
 </head>
 <body>
 <main>
   <div class="toprow">
-    <div></div>
+    <a class="navlink" href="/settings">⚙ Settings</a>
     {% include "_theme_toggle.html" %}
   </div>
   <h1>Your podcasts, without the ads</h1>
   <p class="sub">Add a show, copy its link into Apple Podcasts once, and new episodes show up cleaned. Old episodes are deleted automatically so your disk stays small.</p>
-
   <div class="card">
     <h2>1 &nbsp;Add a show</h2>
     <label for="q">Search by name</label>
@@ -65,9 +64,8 @@
   <div class="card">
     <h2>2 &nbsp;Listen in Apple Podcasts</h2>
     <div class="steps">
-      <div><b>①</b> Phone + computer on the same Wi-Fi (for now).</div>
-      <div><b>②</b> Copy a show link below → iPhone Podcasts → Library → <b>…</b> → <b>Follow a Show by URL</b> → paste.</div>
-      <div><b>③</b> Play. First play of a new episode takes a few minutes to clean; afterwards it's instant.</div>
+      <div><b>①</b> Copy a show link below → Podcasts → Library → <b>…</b> → <b>Follow a Show by URL</b> → paste.</div>
+      <div><b>②</b> Play. First play of a new episode takes a few minutes to clean; afterwards it's instant.</div>
     </div>
     {% if cards %}
     <ul>
@@ -93,30 +91,9 @@
   </div>
 
   <div class="card">
-    <h2>Storage — small by design</h2>
-    <p class="sub" style="margin:0">Using {{ '%.1f'|format(storage.bytes/1024**3) }} GB of {{ '%.1f'|format(storage.limit_bytes/1024**3) }} GB. Oldest episodes delete themselves first. Originals are deleted after cleaning.</p>
+    <h2>Storage</h2>
+    <p class="sub" style="margin:0">Using {{ '%.1f'|format(storage.bytes/1024**3) }} GB of {{ '%.1f'|format(storage.limit_bytes/1024**3) }} GB. Oldest episodes delete themselves first. <a href="/settings">Change limits in Settings</a>.</p>
     <div class="bar"><div style="width:{{ [storage_pct,100]|min }}%"></div></div>
-    <form method="post" action="/settings/global">
-      <div class="row">
-        <div><label>Max storage (GB)</label><input name="max_cache_gb" type="number" step="0.5" min="0.5" max="50" value="{{ global_settings.max_cache_gb }}" /></div>
-        <div><label>Keep latest (per show)</label><input name="keep_last_n" type="number" min="1" max="50" value="{{ global_settings.keep_last_n }}" /></div>
-        <div><label>Delete after (days)</label><input name="delete_after_days" type="number" min="1" max="365" value="{{ global_settings.delete_after_days }}" /></div>
-        <div><label>Check for new (minutes)</label><input name="poll_minutes" type="number" min="5" max="1440" value="{{ global_settings.poll_minutes }}" /></div>
-      </div>
-      <button type="submit">Save</button>
-      {% if saved == 'settings' %}<span class="ok">Saved.</span>{% endif %}
-    </form>
-  </div>
-
-  <div class="card">
-    <h2>Ad detection key</h2>
-    <p class="sub">Needed once so the app can spot sponsor reads. {% if zen.configured %}<span class="ok">Connected ({{ zen.source }}).</span>{% else %}<span class="warn">Not connected yet.</span>{% endif %}</p>
-    {% if saved == 'zen' %}<p class="ok">Key saved.</p>{% endif %}
-    <form method="post" action="/settings/zen-key">
-      <input name="zen_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
-      <button type="submit">Save key</button>
-      <button type="submit" name="clear" value="1" class="ghost">Remove</button>
-    </form>
   </div>
 </main>
 <script>

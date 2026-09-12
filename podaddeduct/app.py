@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import db
+from podaddeduct import __version__ as APP_VERSION
 from .chapters import build_chapters_json
 from .config import settings
 from .feeds import (
@@ -32,7 +33,7 @@ from .feeds import (
     slug_for_upstream,
 )
 from .process import enqueue_episode, ensure_worker
-from .secrets import set_zen_api_key, zen_key_status
+from .secrets import get_app_password, password_source, set_app_password, set_zen_api_key, zen_key_status
 
 logger = logging.getLogger("podaddeduct")
 logging.basicConfig(level=logging.INFO)
@@ -58,8 +59,25 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 _poll_task: asyncio.Task | None = None
 
 
+def configured_public_base() -> str:
+    """Admin-configured base URL from the UI (kv) or env. "" = auto-detect."""
+    raw = (db.runtime_str("public_base_url") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    from urllib.parse import urlparse as _urlparse
+
+    host = _urlparse(raw).hostname or ""
+    if host in {"127.0.0.1", "localhost"} or not host:
+        return ""
+    return raw
+
+
 def public_base(request: Request) -> str:
-    """URL phones must use. Prefer the Host header the client actually hit."""
+    """URL phones must use. Configured value wins; else the Host header the
+    client actually hit (how tunnels work with no config); else LAN detect."""
+    conf = configured_public_base()
+    if conf:
+        return conf
     host = request.headers.get("host") or ""
     if host and not host.startswith("127.0.0.1") and not host.startswith("localhost"):
         scheme = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
@@ -134,11 +152,11 @@ async def sync_feed_episodes(
         episodes.append(ep)
 
     fs = db.get_feed_settings(feed)
-    auto_on = fs.get("auto_download", True) and settings.auto_prepare_latest
+    auto_on = fs.get("auto_download", True) and db.runtime_bool("auto_prepare_latest")
     should_queue = queue_recent or (autodl and auto_on)
     if should_queue and episodes:
         # Only the newest unprepared episode — never the whole back-catalog.
-        target = episodes[:1] if autodl and not queue_recent else episodes[: settings.process_recent]
+        target = episodes[:1] if autodl and not queue_recent else episodes[: db.runtime_int("process_recent", minimum=1, maximum=20)]
         for ep in target:
             fresh = db.get_episode(ep.id)
             if not fresh:
@@ -204,13 +222,42 @@ async def _poll_loop() -> None:
         await asyncio.sleep(interval)
 
 
-# --- Auth (optional shared password for tunnel exposure) ---
+# --- Auth (family password for direct/LAN access; Cloudflare Access sits in front remotely) ---
+#
+# Default-deny: every route checks _authed except the explicit public
+# allowlist (player feed XML + audio + login page). Podcast apps can't log
+# in, so /feeds/*.xml and /audio/* stay open by design.
+
+_login_attempts: dict[str, list[float]] = {}
+
+
+def _login_allowed(ip: str) -> bool:
+    import time
+
+    now = time.monotonic()
+    hits = [t for t in _login_attempts.get(ip, []) if now - t < 600]
+    _login_attempts[ip] = hits
+    return len(hits) < 5
+
+
+def _login_failed(ip: str) -> None:
+    import time
+
+    _login_attempts.setdefault(ip, []).append(time.monotonic())
+
+
+def _cookie_secure(request: Request) -> bool:
+    """Secure cookie over https (tunnel) without breaking LAN-http login."""
+    if request.url.scheme == "https":
+        return True
+    return (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip() == "https"
+
 
 def _authed(request: Request) -> bool:
-    if not settings.app_password:
+    if not get_app_password():
         return True
     tok = request.cookies.get("podaddeduct_auth", "")
-    want = hashlib.sha256(settings.app_password.encode()).hexdigest()
+    want = hashlib.sha256(get_app_password().encode()).hexdigest()
     return hmac.compare_digest(tok, want)
 
 
@@ -221,15 +268,24 @@ async def login_page(request: Request) -> HTMLResponse:
 
 @app.post("/login")
 async def login(request: Request, password: str = Form("")) -> RedirectResponse:
-    if settings.app_password and hmac.compare_digest(password, settings.app_password):
+    ip = request.client.host if request.client else "?"
+    if not _login_allowed(ip):
+        return templates.TemplateResponse(
+            request, "login.html",
+            {"error": "Too many tries — wait a few minutes."}, status_code=429,
+        )
+    if get_app_password() and hmac.compare_digest(password, get_app_password()):
+        _login_attempts.pop(ip, None)
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             "podaddeduct_auth",
-            hashlib.sha256(settings.app_password.encode()).hexdigest(),
+            hashlib.sha256(get_app_password().encode()).hexdigest(),
             httponly=True,
             samesite="lax",
+            secure=_cookie_secure(request),
         )
         return resp
+    _login_failed(ip)
     return templates.TemplateResponse(request, "login.html", {"error": "Wrong password."})
 
 
@@ -264,16 +320,54 @@ async def home(request: Request) -> HTMLResponse:
             "cards": cards,
             "storage": stats,
             "storage_pct": round(100 * stats["bytes"] / max(1, stats["limit_bytes"]), 1),
+        },
+    )
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request) -> HTMLResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    stats = db.storage_stats()
+    eff = {
+        "public_base_url": configured_public_base(),
+        "process_recent": db.runtime_int("process_recent", minimum=1, maximum=20),
+        "feed_item_limit": db.runtime_int("feed_item_limit", minimum=1, maximum=500),
+        "min_ad_seconds": db.runtime_float("min_ad_seconds", minimum=1.0, maximum=300.0),
+        "silence_snap_window": db.runtime_float("silence_snap_window", minimum=0.0, maximum=10.0),
+        "delete_original_after_cut": db.runtime_bool("delete_original_after_cut"),
+        "auto_prepare_latest": db.runtime_bool("auto_prepare_latest"),
+        "zen_model": db.runtime_str("zen_model"),
+        "zen_fallback_model": db.runtime_str("zen_fallback_model"),
+        "zen_base_url": db.runtime_str("zen_base_url"),
+        "zen_chunk_chars": db.runtime_int("zen_chunk_chars", minimum=1000),
+        "stt_python": db.runtime_str("stt_python"),
+        "stt_sidecar": db.runtime_str("stt_sidecar"),
+        "stt_model": db.runtime_str("stt_model"),
+    }
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {
+            "public_base": public_base(request),
+            "storage": stats,
+            "storage_pct": round(100 * stats["bytes"] / max(1, stats["limit_bytes"]), 1),
             "global_settings": db.get_global_settings(),
+            "effective": eff,
             "zen": zen_key_status(),
-            "zen_model": settings.zen_model,
+            "password_set": bool(get_app_password()),
+            "password_source": password_source(),
+            "app_version": APP_VERSION,
             "saved": request.query_params.get("saved"),
+            "settings_error": request.query_params.get("err"),
         },
     )
 
 
 @app.get("/api/search")
-async def api_search(q: str = "") -> JSONResponse:
+async def api_search(request: Request, q: str = "") -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
     from .search import search_podcasts
 
     try:
@@ -284,13 +378,17 @@ async def api_search(q: str = "") -> JSONResponse:
 
 
 @app.get("/api/storage")
-async def api_storage() -> JSONResponse:
+async def api_storage(request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
     stats = db.storage_stats()
     return JSONResponse(stats)
 
 
 @app.get("/api/episodes/{episode_id}/status")
-async def api_episode_status(episode_id: int) -> JSONResponse:
+async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
     ep = db.get_episode(episode_id)
     if not ep:
         raise HTTPException(404, "Episode not found")
@@ -314,6 +412,8 @@ async def save_zen_key(
     zen_api_key: str = Form(""),
     clear: str = Form(""),
 ) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     if clear:
         set_zen_api_key(None)
     else:
@@ -322,16 +422,24 @@ async def save_zen_key(
     if "/episodes/" in ref:
         sep = "&" if "?" in ref else "?"
         return RedirectResponse(f"{ref}{sep}key_saved=1", status_code=303)
+    from urllib.parse import urlparse as _urlparse2
+
+    if _urlparse2(ref).path.startswith("/settings"):
+        return RedirectResponse("/settings?saved=zen", status_code=303)
     return RedirectResponse("/?saved=zen", status_code=303)
 
 
 @app.get("/api/zen-status")
-async def api_zen_status() -> JSONResponse:
+async def api_zen_status(request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
     return JSONResponse(zen_key_status())
 
 
 @app.post("/feeds")
 async def add_feed(request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     raw = str(form.get("upstream_url") or form.get("feed_url") or form.get("url") or "").strip()
     artwork = str(form.get("artwork") or "").strip()
@@ -343,14 +451,129 @@ async def add_feed(request: Request) -> RedirectResponse:
 
 @app.post("/settings/global")
 async def save_global_settings(request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     updates: dict[str, str] = {}
-    for k in ("max_cache_gb", "keep_last_n", "delete_after_days", "poll_minutes"):
-        if form.get(k) not in (None, ""):
-            updates[k] = str(form.get(k))
+    errors: list[str] = []
+
+    def num(key: str, *, minimum: float, maximum: float) -> None:
+        raw = form.get(key)
+        if raw in (None, ""):
+            return
+        try:
+            val = float(str(raw))
+        except ValueError:
+            errors.append(f"{key} must be a number.")
+            return
+        if not (minimum <= val <= maximum):
+            errors.append(f"{key} must be between {minimum:g} and {maximum:g}.")
+            return
+        updates[key] = str(raw)
+
+    for k in ("max_cache_gb", "keep_last_n", "delete_after_days", "poll_minutes",
+              "process_recent", "feed_item_limit", "min_ad_seconds",
+              "silence_snap_window", "zen_chunk_chars"):
+        num(k, minimum=0.1 if k in {"max_cache_gb", "min_ad_seconds", "silence_snap_window"} else 1,
+            maximum=500 if k == "feed_item_limit" else (10**6 if k == "zen_chunk_chars" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50))
+
+    for k in ("zen_model", "zen_fallback_model", "zen_base_url",
+              "stt_python", "stt_sidecar", "stt_model"):
+        raw = form.get(k)
+        if raw not in (None, ""):
+            updates[k] = str(raw).strip()
+
+    raw_base = str(form.get("public_base_url") or "").strip().rstrip("/")
+    if raw_base:
+        import ipaddress as _ipaddress
+
+        from urllib.parse import urlparse as _urlparse
+
+        parts = _urlparse(raw_base if "://" in raw_base else f"https://{raw_base}")
+        host = (parts.hostname or "").strip().lower()
+        # Overcast fetches from its own servers: only a public https domain
+        # works. Literal IPs, LAN names, and plain http are rejected with
+        # a plain-language error instead of failing mysteriously later.
+        is_ip = True
+        try:
+            _ipaddress.ip_address(host)
+        except ValueError:
+            is_ip = False
+        if (
+            not host
+            or host in {"localhost"}
+            or host.endswith(".local")
+            or is_ip
+            or (parts.scheme and parts.scheme != "https")
+        ):
+            errors.append("Public address must be a public https:// domain (for Overcast). LAN IPs don't work there.")
+        else:
+            updates["public_base_url"] = f"https://{host}" + (
+                f":{parts.port}" if parts.port not in (None, 443) else ""
+            )
+    elif form.get("public_base_url") == "":
+        updates["public_base_url"] = ""
+
+    for k in ("auto_prepare_latest", "delete_original_after_cut"):
+        if k in form:
+            updates[k] = "true" if str(form.get(k)).lower() in {"1", "on", "true"} else "false"
+        elif form.get("settings_form"):
+            updates[k] = "false"
+
     if updates:
         db.set_global_settings(updates)
-    return RedirectResponse("/?saved=settings", status_code=303)
+    from urllib.parse import quote as _quote
+
+    dest = "/settings?saved=settings"
+    if errors:
+        dest += "&err=" + _quote("; ".join(errors))
+    return RedirectResponse(dest, status_code=303)
+
+
+@app.post("/settings/password")
+async def save_app_password(request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    current = str(form.get("current") or "")
+    new = str(form.get("new") or "")
+    confirm = str(form.get("confirm") or "")
+    existing = get_app_password()
+    from urllib.parse import quote as _quote2
+
+    if existing and not hmac.compare_digest(current, existing):
+        return RedirectResponse("/settings?err=" + _quote2("Current password didn't match."), status_code=303)
+    if new != confirm:
+        return RedirectResponse("/settings?err=" + _quote2("New passwords didn't match."), status_code=303)
+    set_app_password(new)
+    if not new:
+        resp = RedirectResponse("/settings?saved=password-off", status_code=303)
+        resp.delete_cookie("podaddeduct_auth")
+        return resp
+    return RedirectResponse("/settings?saved=password", status_code=303)
+
+
+@app.get("/api/zen-models")
+async def api_zen_models(request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
+    from .seed import fetch_zen_models
+
+    return JSONResponse(fetch_zen_models())
+
+
+@app.post("/api/zen-test")
+async def api_zen_test(request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    model = str((body or {}).get("model") or "")
+    from .seed import test_zen_connection
+
+    return JSONResponse(test_zen_connection(model or None))
 
 
 @app.get("/feeds/{slug}.xml")
@@ -394,6 +617,8 @@ async def show_page(slug: str, request: Request) -> HTMLResponse:
 
 @app.get("/feeds/{slug}", response_class=HTMLResponse)
 async def feed_status(slug: str, request: Request) -> HTMLResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)  # type: ignore[return-value]
     feed = db.get_feed_by_slug(slug)
     if not feed:
         raise HTTPException(404, "Show not found")
@@ -402,6 +627,8 @@ async def feed_status(slug: str, request: Request) -> HTMLResponse:
 
 @app.post("/shows/{slug}/settings")
 async def save_show_settings(slug: str, request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     feed = db.get_feed_by_slug(slug)
     if not feed:
         raise HTTPException(404, "Show not found")
@@ -430,7 +657,9 @@ async def save_show_settings(slug: str, request: Request) -> RedirectResponse:
 
 
 @app.post("/shows/{slug}/refresh")
-async def refresh_show(slug: str) -> RedirectResponse:
+async def refresh_show(slug: str, request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     feed = db.get_feed_by_slug(slug)
     if not feed:
         raise HTTPException(404, "Show not found")
@@ -442,7 +671,9 @@ async def refresh_show(slug: str) -> RedirectResponse:
 
 
 @app.post("/shows/{slug}/delete")
-async def delete_show(slug: str) -> RedirectResponse:
+async def delete_show(slug: str, request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     feed = db.get_feed_by_slug(slug)
     if not feed:
         raise HTTPException(404, "Show not found")
@@ -471,7 +702,7 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
             "saved_seconds": saved,
             "public_base": public_base(request),
             "zen": zen_key_status(),
-            "zen_model": settings.zen_model,
+            "zen_model": db.runtime_str("zen_model"),
             "key_saved": request.query_params.get("key_saved"),
             "has_clean": db.has_clean_audio(ep),
             "has_audio": bool(db.served_audio_path(ep)),
@@ -480,7 +711,9 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
 
 
 @app.post("/episodes/{episode_id}/recheck")
-async def recheck_episode(episode_id: int) -> RedirectResponse:
+async def recheck_episode(episode_id: int, request: Request) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     ep = db.get_episode(episode_id)
     if not ep:
         raise HTTPException(404, "Episode not found")
@@ -489,15 +722,18 @@ async def recheck_episode(episode_id: int) -> RedirectResponse:
 
 
 @app.post("/episodes/{episode_id}/reseed")
-async def reseed_episode(episode_id: int) -> RedirectResponse:
-    return await recheck_episode(episode_id)
+async def reseed_episode(episode_id: int, request: Request) -> RedirectResponse:
+    return await recheck_episode(episode_id, request)
 
 
 @app.post("/episodes/{episode_id}/ranges")
 async def save_ranges(
     episode_id: int,
+    request: Request,
     ranges_text: str = Form(""),
 ) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     from .process import apply_manual_ranges
 
     ep = db.get_episode(episode_id)
@@ -576,7 +812,9 @@ async def audio(episode_id: int, request: Request) -> Response:
 
 
 @app.get("/chapters/{episode_id}.json")
-async def chapters_json(episode_id: int) -> JSONResponse:
+async def chapters_json(episode_id: int, request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
     ep = db.get_episode(episode_id)
     if not ep:
         raise HTTPException(404, "Episode not found")
@@ -584,7 +822,9 @@ async def chapters_json(episode_id: int) -> JSONResponse:
 
 
 @app.get("/export.opml")
-async def export_opml() -> PlainTextResponse:
+async def export_opml(request: Request) -> PlainTextResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)  # type: ignore[return-value]
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<opml version="1.0"><head><title>podaddeduct</title></head><body>',
@@ -599,7 +839,9 @@ async def export_opml() -> PlainTextResponse:
 
 
 @app.post("/import-opml")
-async def import_opml(file: UploadFile) -> RedirectResponse:
+async def import_opml(request: Request, file: UploadFile) -> RedirectResponse:
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     import re
     import xml.etree.ElementTree as ET
 
