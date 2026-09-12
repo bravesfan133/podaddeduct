@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
-
-import numpy as np
+from typing import Any
 
 logger = logging.getLogger("podaddeduct.decode")
+
+# Probe vainfo once (or every VAAPI_TTL_S). Page views must never spawn it.
+VAAPI_TTL_S = 600.0
+_vaapi_cache: tuple[float, bool] | None = None
 
 
 def find_ffprobe() -> str | None:
@@ -45,8 +49,8 @@ def probe_duration(path: str | Path) -> float:
         return 0.0
 
 
-def vaapi_available() -> bool:
-    """True when /dev/dri render node + vainfo look usable (N100 iGPU passthrough)."""
+def _probe_vaapi() -> bool:
+    """Run vainfo once. Expensive — only via cache miss / lifespan."""
     import os
 
     render = Path("/dev/dri/renderD128")
@@ -68,9 +72,35 @@ def vaapi_available() -> bool:
     return proc.returncode == 0 and ("VAProfile" in out or "iHD" in out or "Intel" in out)
 
 
-def _decode_via_miniaudio(path: Path, target_sr: int) -> tuple[np.ndarray, int]:
+def vaapi_available(*, force: bool = False) -> bool:
+    """Cached VAAPI check. Does not spawn vainfo on every Settings/health hit."""
+    global _vaapi_cache
+    now = time.monotonic()
+    if not force and _vaapi_cache is not None:
+        ts, val = _vaapi_cache
+        if now - ts < VAAPI_TTL_S:
+            return val
+    val = _probe_vaapi()
+    _vaapi_cache = (now, val)
+    return val
+
+
+def clear_vaapi_cache() -> None:
+    """Test helper."""
+    global _vaapi_cache
+    _vaapi_cache = None
+
+
+def _numpy() -> Any:
+    import numpy as np
+
+    return np
+
+
+def _decode_via_miniaudio(path: Path, target_sr: int):
     import miniaudio
 
+    np = _numpy()
     decoded = miniaudio.decode_file(str(path), nchannels=1, sample_rate=target_sr)
     samples = np.frombuffer(decoded.samples, dtype=np.int16).astype(np.float32)
     if decoded.nchannels > 1:
@@ -116,15 +146,14 @@ def _decode_via_ffmpeg(
     *,
     start: float | None = None,
     length: float | None = None,
-) -> tuple[np.ndarray, int]:
+):
     """Decode (optional window) to mono float32 PCM via ffmpeg."""
+    np = _numpy()
     cmd = _ffmpeg_pcm_cmd(path, target_sr, start=start, length=length)
     proc = subprocess.run(cmd, capture_output=True, check=False)
     if proc.returncode != 0 or not proc.stdout:
         # Retry without VAAPI if hwaccel failed.
         if "-hwaccel" in cmd:
-            cmd = [c for c in cmd if c not in ("-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128")]
-            # Rebuild cleanly without hwaccel
             cmd = [find_ffmpeg() or "ffmpeg", "-v", "error"]
             if start is not None and start > 0:
                 cmd.extend(["-ss", f"{start:.3f}"])
@@ -144,7 +173,7 @@ def _decode_via_ffmpeg(
     return samples, target_sr
 
 
-def decode_audio_file(path: str | Path, target_sr: int = 11025) -> tuple[np.ndarray, int]:
+def decode_audio_file(path: str | Path, target_sr: int = 11025):
     """Decode audio to mono float32 PCM. Tries miniaudio, then ffmpeg for m4a/AAC."""
     path = Path(path)
     try:
@@ -154,7 +183,7 @@ def decode_audio_file(path: str | Path, target_sr: int = 11025) -> tuple[np.ndar
         return _decode_via_ffmpeg(path, target_sr)
 
 
-def load_mono_pcm(path: str | Path, target_sr: int = 11025) -> tuple[np.ndarray, int]:
+def load_mono_pcm(path: str | Path, target_sr: int = 11025):
     return decode_audio_file(path, target_sr=target_sr)
 
 
@@ -163,7 +192,7 @@ def load_pcm_window(
     start: float,
     end: float,
     target_sr: int = 11025,
-) -> tuple[np.ndarray, int]:
+):
     """Decode only [start, end) seconds — for silence snap around ad edges."""
     path = Path(path)
     length = max(0.05, end - start)

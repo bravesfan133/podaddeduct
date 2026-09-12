@@ -115,11 +115,6 @@ def backend_status() -> dict:
     import shutil
 
     ffmpeg = shutil.which("ffmpeg")
-    try:
-        __import__("faster_whisper")
-        faster_whisper = True
-    except ImportError:
-        faster_whisper = False
     ok = tool is not None and script.exists() and ffmpeg is not None
     return {
         "ok": ok,
@@ -128,7 +123,7 @@ def backend_status() -> dict:
         "script": str(script),
         "script_exists": script.exists(),
         "ffmpeg": ffmpeg,
-        "faster_whisper_installed": faster_whisper,
+        "faster_whisper_installed": False,
         "model": db.runtime_str("stt_model"),
     }
 

@@ -363,6 +363,39 @@ def list_episodes_page(
     return [_episode_from_row(r) for r in rows]
 
 
+def feed_card_stats(feed_id: int) -> dict[str, Any]:
+    """Cheap home-card counts: no full episode list, no Path.exists scans."""
+    with connect() as conn:
+        total = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM episodes WHERE feed_id = ?", (feed_id,)
+            ).fetchone()["n"]
+        )
+        ready = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM episodes WHERE feed_id = ? "
+                "AND status IN ('ready', 'manual')",
+                (feed_id,),
+            ).fetchone()["n"]
+        )
+        working = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM episodes WHERE feed_id = ? AND status = 'working'",
+                (feed_id,),
+            ).fetchone()["n"]
+        )
+        latest_row = conn.execute(
+            "SELECT * FROM episodes WHERE feed_id = ? ORDER BY pub_ts DESC, id ASC LIMIT 1",
+            (feed_id,),
+        ).fetchone()
+    return {
+        "total": total,
+        "ready": ready,
+        "working": working,
+        "latest": _episode_from_row(latest_row) if latest_row else None,
+    }
+
+
 def _episode_filter_sql(feed_id: int, status_filter: str | None) -> tuple[str, tuple]:
     filt = (status_filter or "all").strip().lower()
     if filt == "ready":
@@ -828,25 +861,36 @@ def models_to_try() -> list[str]:
 # --- Storage ---
 
 def storage_stats() -> dict[str, Any]:
+    """Sum size_bytes in SQL. Only stat() legacy rows where size_bytes is 0."""
     total = 0
     per_feed: dict[int, int] = {}
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT feed_id, clean_audio_path, audio_path, size_bytes FROM episodes"
+        for r in conn.execute(
+            "SELECT feed_id, COALESCE(SUM(size_bytes), 0) AS bytes "
+            "FROM episodes GROUP BY feed_id"
+        ).fetchall():
+            size = int(r["bytes"] or 0)
+            per_feed[int(r["feed_id"])] = size
+            total += size
+        legacy = conn.execute(
+            "SELECT feed_id, clean_audio_path, audio_path FROM episodes "
+            "WHERE COALESCE(size_bytes, 0) <= 0 "
+            "AND (clean_audio_path IS NOT NULL OR audio_path IS NOT NULL)"
         ).fetchall()
-    for r in rows:
-        size = int(r["size_bytes"] or 0)
+    for r in legacy:
+        size = 0
+        for p in (r["clean_audio_path"], r["audio_path"]):
+            if p:
+                try:
+                    size = Path(p).stat().st_size
+                    break
+                except OSError:
+                    continue
         if size <= 0:
-            # Fall back to on-disk size for rows written before size tracking.
-            for p in (r["clean_audio_path"], r["audio_path"]):
-                if p:
-                    try:
-                        size = Path(p).stat().st_size
-                        break
-                    except OSError:
-                        continue
+            continue
         total += size
-        per_feed[r["feed_id"]] = per_feed.get(r["feed_id"], 0) + size
+        fid = int(r["feed_id"])
+        per_feed[fid] = per_feed.get(fid, 0) + size
     try:
         limit_gb = float(get_global_settings().get("max_cache_gb") or 3.0)
     except ValueError:

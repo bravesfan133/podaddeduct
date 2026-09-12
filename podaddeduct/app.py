@@ -376,17 +376,15 @@ async def home(request: Request) -> HTMLResponse:
     feeds = db.list_feeds()
     cards = []
     for f in feeds:
-        eps = db.list_episodes(f.id)
-        ready = sum(1 for e in eps if e.status in {"ready", "manual"} and db.served_audio_path(e))
-        working = sum(1 for e in eps if e.status == "working")
+        stats_card = db.feed_card_stats(f.id)
         cards.append(
             {
                 "feed": f,
                 "settings": db.get_feed_settings(f),
-                "total": len(eps),
-                "ready": ready,
-                "working": working,
-                "latest": eps[0] if eps else None,
+                "total": stats_card["total"],
+                "ready": stats_card["ready"],
+                "working": stats_card["working"],
+                "latest": stats_card["latest"],
             }
         )
     stats = db.storage_stats()
