@@ -66,8 +66,8 @@ class Settings(BaseSettings):
     zen_chunk_chars: int = 12000
     # Ad-detection LLM provider ("groq" or "zen") + Groq chat models.
     llm_provider: str = "groq"
-    groq_llm_model: str = "llama-3.3-70b-versatile"
-    groq_llm_fallback_model: str = "llama-3.1-8b-instant"
+    groq_llm_model: str = "openai/gpt-oss-120b"
+    groq_llm_fallback_model: str = "openai/gpt-oss-20b"
     # When /responses returns MissingSessionID for free models, call OpenCode CLI.
     opencode_bin: str = "opencode"
     opencode_model: str = "opencode/muse-spark-1.3-contributor-free"

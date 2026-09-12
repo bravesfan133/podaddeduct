@@ -262,8 +262,14 @@ def ad_models_to_try() -> list[tuple[str, str]]:
     ordered: list[tuple[str, str]] = []
     for key in keys:
         mid = db.runtime_str(key).strip()
+        if provider == "groq" and mid in DEAD_GROQ_MODELS:
+            logger.warning("Ignoring retired Groq model %s; using current default", mid)
+            continue
         if mid and (provider, mid) not in ordered:
             ordered.append((provider, mid))
+    if provider == "groq" and not ordered:
+        # Everything saved is dead — fall back to current models.
+        ordered = [("groq", m) for m in CURATED_GROQ_MODELS]
     return ordered
 
 
@@ -340,9 +346,16 @@ CURATED_ZEN_MODELS = [
 ]
 
 CURATED_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+]
+
+# Retired by Groq (Aug 2026) — 404 for everyone. Filtered out of saved
+# settings so old installs heal without a UI visit.
+DEAD_GROQ_MODELS = frozenset({
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-]
+})
 
 
 def _live_model_ids(base: str, api_key: str, *, path: str = "/models") -> list[str] | None:

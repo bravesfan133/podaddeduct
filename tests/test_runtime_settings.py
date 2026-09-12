@@ -145,7 +145,7 @@ def test_zen_models_falls_back_without_key(tmp_path, monkeypatch):
     ):
         out = seed_mod.fetch_zen_models()
     assert out["live"] is False
-    assert "llama-3.3-70b-versatile" in out["models"]
+    assert "openai/gpt-oss-120b" in out["models"]
 
 
 def test_zen_test_reports_no_key(tmp_path, monkeypatch):

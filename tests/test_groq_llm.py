@@ -60,12 +60,12 @@ def test_groq_chat_success(tmp_path, monkeypatch):
     _FakeClient.instances.clear()
     fake = _FakeClient([_ok_choices('[{"start": 1, "end": 2}]')])
     with patch.object(seed_mod.httpx, "Client", return_value=fake):
-        out = seed_mod._groq_chat("k", "llama-3.3-70b-versatile", "hi")
+        out = seed_mod._groq_chat("k", "openai/gpt-oss-120b", "hi")
     assert out == '[{"start": 1, "end": 2}]'
     url, kwargs = fake.posts[0]
     assert url == "https://api.groq.com/openai/v1/chat/completions"
     assert kwargs["headers"]["Authorization"] == "Bearer k"
-    assert kwargs["json"]["model"] == "llama-3.3-70b-versatile"
+    assert kwargs["json"]["model"] == "openai/gpt-oss-120b"
 
 
 def test_groq_chat_retries_429_then_succeeds(tmp_path, monkeypatch):
@@ -106,8 +106,8 @@ def test_ad_models_default_to_groq(tmp_path, monkeypatch):
 
     assert seed_mod.ad_provider() == "groq"
     assert seed_mod.ad_models_to_try() == [
-        ("groq", "llama-3.3-70b-versatile"),
-        ("groq", "llama-3.1-8b-instant"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("groq", "openai/gpt-oss-20b"),
     ]
 
 
@@ -163,13 +163,13 @@ def test_settings_save_accepts_provider_keys(tmp_path, monkeypatch):
         r = client.post(
             "/settings/global",
             data={"settings_form": "1", "llm_provider": "groq",
-                  "groq_llm_model": "llama-3.3-70b-versatile",
-                  "groq_llm_fallback_model": "llama-3.1-8b-instant"},
+                  "groq_llm_model": "openai/gpt-oss-120b",
+                  "groq_llm_fallback_model": "openai/gpt-oss-20b"},
             follow_redirects=False,
         )
         assert r.status_code == 303
     assert db.runtime_str("llm_provider") == "groq"
-    assert db.runtime_str("groq_llm_model") == "llama-3.3-70b-versatile"
+    assert db.runtime_str("groq_llm_model") == "openai/gpt-oss-120b"
 
     with TestClient(app) as client:
         r = client.post(
@@ -180,3 +180,18 @@ def test_settings_save_accepts_provider_keys(tmp_path, monkeypatch):
         assert r.status_code == 303
         assert "err=" in r.headers["location"]
     assert db.runtime_str("llm_provider") == "groq"
+
+
+def test_dead_groq_models_auto_heal(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    db.set_global_settings({
+        "llm_provider": "groq",
+        "groq_llm_model": "llama-3.3-70b-versatile",
+        "groq_llm_fallback_model": "llama-3.1-8b-instant",
+    })
+    assert seed_mod.ad_models_to_try() == [
+        ("groq", "openai/gpt-oss-120b"),
+        ("groq", "openai/gpt-oss-20b"),
+    ]

@@ -169,6 +169,8 @@ def friendly_error(err: str | None) -> str:
         return "Ad detection needs a valid API key — check Settings → Ad detection."
     if "groq" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
         return "Ad detection needs a valid Groq key — check Settings → Server."
+    if "model_not_found" in text or "does not exist" in text:
+        return "That AI model was retired — pick a current one in Settings → Ad detection."
     if "ffmpeg" in text:
         return "Audio cutting failed — check server logs, then hit Prepare to retry."
     if "no space" in text or "errno 28" in text or "disk" in text:
