@@ -92,7 +92,7 @@ def test_audio_head_queues_nothing(tmp_path, monkeypatch):
     assert db.get_episode(ep.id).status == "pending"
 
 
-def test_audio_503_queues_priority_while_working(tmp_path, monkeypatch):
+def test_audio_redirects_while_working(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct.app import app
     from podaddeduct.process import _queued
@@ -102,12 +102,55 @@ def test_audio_503_queues_priority_while_working(tmp_path, monkeypatch):
                            enclosure_url="https://example.com/ep.mp3", pub_date=None)
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.get(f"/audio/{ep.id}", follow_redirects=False)
-    # Strict: never serve with-ads bytes. 503 + retry while cleaning runs.
-    assert resp.status_code == 503
-    assert resp.headers["retry-after"] == "60"
-    assert "location" not in resp.headers
+    # Overcast treats 503 as "DELETED BY PUBLISHER"; 302 to the publisher
+    # enclosure plays immediately while cleaning runs in the background.
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "https://example.com/ep.mp3"
     assert ep.id in _queued or db.get_episode(ep.id).status in ("pending", "working")
     _queued.discard(ep.id)
+
+
+def test_audio_redirects_after_janitor_eviction(tmp_path, monkeypatch):
+    """Evicted episodes must stay playable via publisher fallback."""
+    from podaddeduct.app import app
+    from podaddeduct.process import _queued
+    from podaddeduct.retain import run_janitor
+
+    _setup(tmp_path, monkeypatch)
+    db.set_global_settings({"max_cache_gb": "10", "delete_after_days": "365"})
+    feed = db.create_feed(slug="s5b", upstream_url="https://example.com/rss5b", title="S5b")
+    db.update_feed_settings(feed.id, {"keep_last": 1})
+    older = db.upsert_episode(
+        feed.id, guid="old", title="Old",
+        enclosure_url="https://example.com/old.mp3",
+        pub_date="Mon, 01 Jan 2026 00:00:00 GMT",
+    )
+    newer = db.upsert_episode(
+        feed.id, guid="new", title="New",
+        enclosure_url="https://example.com/new.mp3",
+        pub_date="Tue, 02 Jan 2026 00:00:00 GMT",
+    )
+    for ep in (older, newer):
+        p = tmp_path / "audio" / f"{ep.id}.clean.mp3"
+        p.write_bytes(b"x" * 100)
+        db.update_episode(ep.id, clean_audio_path=str(p), size_bytes=100, status="ready")
+
+    run_janitor()
+    older = db.get_episode(older.id)
+    assert older is not None
+    assert older.clean_audio_path is None
+    assert older.status == "pending"
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.get(f"/audio/{older.id}", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "https://example.com/old.mp3"
+    _queued.discard(older.id)
+
+    # Newer kept file still serves locally.
+    resp2 = client.get(f"/audio/{newer.id}", follow_redirects=False)
+    assert resp2.status_code == 200
+
 
 
 def test_audio_serves_clean_with_size_tracking(tmp_path, monkeypatch):

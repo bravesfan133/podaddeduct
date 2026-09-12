@@ -218,10 +218,12 @@ def generate_custom_feed_xml(
     episodes: list[db.Episode],
     public_base: str,
 ) -> str:
-    """Build a lightweight RSS 2.0 feed from local ready episodes only.
+    """Build a lightweight RSS 2.0 feed from local episode rows.
 
     No upstream XML is required — podcast apps get an instant, small custom
-    feed whose enclosures always point at /audio/{id}.
+    feed whose enclosures always point at /audio/{id}. Unready episodes are
+    fine to list: that route 302-redirects to the publisher until a clean
+    copy exists, so players never see a failed download.
     """
     channel_title = _xml_text(feed.title or feed.slug)
     channel_desc = _xml_text(feed.description or "")

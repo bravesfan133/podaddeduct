@@ -56,7 +56,7 @@ def test_batch_upsert_matches_single(tmp_path, monkeypatch):
     assert db.upsert_episodes_batch(feed.id, []) == []
 
 
-def test_feed_render_local_ready_only_no_upstream(tmp_path, monkeypatch):
+def test_feed_render_local_no_upstream(tmp_path, monkeypatch):
     """Player feed is served from SQLite — never waits on upstream HTTP."""
     _setup(tmp_path, monkeypatch)
     import podaddeduct.app as app_mod
@@ -92,7 +92,7 @@ def test_feed_render_local_ready_only_no_upstream(tmp_path, monkeypatch):
         assert r2.text == r1.text
         assert calls["n"] == 0
 
-        # Ready episode appears after cache clear; still no upstream fetch.
+        # Ready + pending episodes both appear after cache clear; still no upstream fetch.
         ep = db.upsert_episode(
             feed.id, guid="g2", title="Ep Two",
             enclosure_url="https://example.com/e2.mp3",
@@ -110,10 +110,11 @@ def test_feed_render_local_ready_only_no_upstream(tmp_path, monkeypatch):
         app_mod._feed_cache.clear()
         r3 = client.get("/feeds/mini.xml")
         assert r3.status_code == 200
-        assert r3.text.count("<item>") == 1
+        assert r3.text.count("<item>") == 2
         assert "Ep Two" in r3.text
-        assert "Ep One" not in r3.text
+        assert "Ep One" in r3.text
         assert f"/audio/{ep.id}" in r3.text
+        assert f"/audio/{pending.id}" in r3.text
         assert 'length="64"' in r3.text
         assert pending.status == "pending" or db.get_episode(pending.id).status == "pending"
     assert calls["n"] == 0

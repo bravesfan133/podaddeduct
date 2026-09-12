@@ -7,7 +7,9 @@ Rules (applied oldest-first):
 
 Deleting files keeps the episode row + ad marks + transcript, so a later
 re-request re-downloads and re-cuts in seconds without extra AI cost
-(status goes back to `pending` with ranges preserved).
+(status goes back to `pending` with ranges preserved). Playback still
+works immediately: /audio/{id} 302-redirects to the publisher enclosure
+until the clean copy is rebuilt, so podcast apps never see a hard failure.
 """
 from __future__ import annotations
 

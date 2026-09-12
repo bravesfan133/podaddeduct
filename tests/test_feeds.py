@@ -45,7 +45,8 @@ def test_feed_rewrite_points_at_clean_audio(tmp_path, monkeypatch):
     assert "podcast:chapters" not in xml
 
 
-def test_generate_custom_feed_ready_only(tmp_path, monkeypatch):
+def test_generate_custom_feed_includes_pending(tmp_path, monkeypatch):
+    """Pending episodes stay in the player feed; /audio 302s until cleaned."""
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     (tmp_path / "audio").mkdir()
     db.init_db()
@@ -78,21 +79,24 @@ def test_generate_custom_feed_ready_only(tmp_path, monkeypatch):
     ready = db.get_episode(ready.id)
     assert ready
 
+    # Ready-only helper still filters; the player feed lists every tracked row.
     ready_eps = db.list_ready_episodes(feed.id)
     assert [e.guid for e in ready_eps] == ["g-ready"]
-    assert pending.id not in {e.id for e in ready_eps}
+    all_eps = db.list_episodes(feed.id)
+    assert {e.guid for e in all_eps} == {"g-ready", "g-pending"}
 
-    xml = generate_custom_feed_xml(feed, ready_eps, "http://192.168.0.93:8080")
+    xml = generate_custom_feed_xml(feed, all_eps, "http://192.168.0.93:8080")
     assert "<title>My Show</title>" in xml
     assert "Show notes here" in xml
     assert 'href="https://cdn.example.com/art.jpg"' in xml
     assert "Ready Ep" in xml
-    assert "Pending Ep" not in xml
+    assert "Pending Ep" in xml
     assert f"/audio/{ready.id}" in xml
+    assert f"/audio/{pending.id}" in xml
     assert 'length="50"' in xml
     assert "<itunes:duration>120</itunes:duration>" in xml
     assert "Episode show notes" in xml
-    assert xml.count("<item>") == 1
+    assert xml.count("<item>") == 2
 
 
 def test_generate_custom_feed_empty(tmp_path, monkeypatch):

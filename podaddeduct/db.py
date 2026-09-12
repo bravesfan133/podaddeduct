@@ -305,7 +305,7 @@ def list_episodes(feed_id: int) -> list[Episode]:
 
 
 def list_ready_episodes(feed_id: int) -> list[Episode]:
-    """Episodes published in the custom player feed — processed/clean only."""
+    """Episodes that already have a processed/clean file on disk (or status)."""
     with connect() as conn:
         rows = conn.execute(
             """

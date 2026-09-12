@@ -124,7 +124,13 @@ _FEED_TTL = 60.0
 
 
 async def render_feed_response(feed: db.Feed, request: Request) -> Response:
-    """Serve a custom RSS feed from local ready episodes — no upstream I/O."""
+    """Serve a custom RSS feed from local SQLite — no upstream I/O.
+
+    Every tracked episode is listed (capped by feed_item_limit). Enclosures
+    always point at /audio/{id}, which serves the clean file when ready and
+    otherwise 302-redirects to the publisher so Overcast never sees a
+    download failure.
+    """
     import time
 
     base = public_base(request)
@@ -139,7 +145,8 @@ async def render_feed_response(feed: db.Feed, request: Request) -> Response:
 
     # Fresh row so title/artwork/description reflect the latest background sync.
     feed = db.get_feed(feed.id) or feed
-    episodes = db.list_ready_episodes(feed.id)
+    limit = db.runtime_int("feed_item_limit", minimum=1, maximum=500)
+    episodes = db.list_episodes(feed.id)[: max(1, limit)]
     xml = generate_custom_feed_xml(feed, episodes, base)
     content = xml.encode("utf-8")
     _feed_cache[cache_key] = (time.monotonic(), content)
@@ -929,15 +936,16 @@ async def save_ranges(
 
 @app.api_route("/audio/{episode_id}", methods=["GET", "HEAD"])
 async def audio(episode_id: int, request: Request) -> Response:
-    """Serve cleaned audio. Strict: unprocessed bytes never leave this server.
+    """Serve cleaned audio when ready; otherwise fall back to the publisher file.
 
     - HEAD: report upstream headers only, queue nothing (feed refreshes).
     - GET with a clean file: serve it (206 range support via FileResponse).
     - GET with a finished original and nothing to cut (no ads found): serve
       the original.
-    - GET otherwise: queue at the front and answer 503 + Retry-After so the
-      player keeps retrying until the clean file is ready. Never redirects
-      to the publisher's with-ads file.
+    - GET otherwise: queue at the front and 302-redirect to the publisher
+      enclosure so podcast apps (esp. Overcast) never see a failed download
+      and brand the episode "DELETED BY PUBLISHER". The next play after
+      cleaning finishes gets the ad-free file.
     """
     ep = db.get_episode(episode_id)
     if not ep:
@@ -971,16 +979,10 @@ async def audio(episode_id: int, request: Request) -> Response:
             pass
         return FileResponse(served, media_type="audio/mpeg", filename=f"{episode_id}.mp3")
 
-    # Not clean yet: jump the queue and tell the player to retry.
-    # It shows "downloading" meanwhile and picks up the clean file
-    # on a later attempt — ads never play.
+    # Not clean yet: jump the queue and play the publisher file meanwhile.
+    # Overcast treats 503/404 as "DELETED BY PUBLISHER"; a 302 never does.
     await enqueue_episode(episode_id, priority=True)
-    return Response(
-        status_code=503,
-        headers={"Retry-After": "60", "Cache-Control": "no-store"},
-        content="Episode is being cleaned — retry shortly.",
-        media_type="text/plain",
-    )
+    return RedirectResponse(ep.enclosure_url, status_code=302)
 
 
 @app.get("/chapters/{episode_id}.json")
