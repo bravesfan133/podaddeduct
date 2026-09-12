@@ -1,0 +1,27 @@
+---
+description: Always commit and push finished work without waiting to be asked
+alwaysApply: true
+---
+
+# Commit and push by default
+
+When you finish a task that changes files in this repo, **commit and push** without waiting for the user to ask.
+
+## When
+
+- After implementing a plan, fixing a bug, adding a feature, or updating rules/docs that belong in git
+- Before ending the turn if there are uncommitted changes from **this** work
+
+## How
+
+1. Stage only files related to the work just done (exclude secrets, `.env`, unrelated dirty files)
+2. Commit with a concise message focused on why
+3. Push the current branch to `origin` (`git push -u origin HEAD` if needed)
+4. Tell the user the commit hash / that it was pushed
+
+## Do not
+
+- Ask "want me to commit?" for normal finished work — just do it
+- Leave completed work sitting unstaged/unpushed
+- Force-push or amend unless the user explicitly asks
+- Commit unrelated leftover changes from other tasks; leave those unstaged or commit them separately with their own message
