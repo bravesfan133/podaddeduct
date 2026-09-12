@@ -80,6 +80,49 @@ def _audio_for_stt(audio_path: Path) -> Path:
     return link
 
 
+def _resolve_tool(ref: str) -> Path | None:
+    """Resolve the transcription interpreter: full/relative path first,
+    then PATH lookup for bare names like `python`. None if unresolvable."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    p = Path(ref)
+    if p.exists():
+        return p
+    import shutil
+
+    found = shutil.which(ref)
+    return Path(found) if found else None
+
+
+def backend_status() -> dict:
+    """Self-check for the transcription pipeline. Cheap: no model load."""
+    from . import db
+
+    tool_ref = db.runtime_str("stt_python")
+    script = Path(db.runtime_str("stt_sidecar"))
+    tool = _resolve_tool(tool_ref)
+    import shutil
+
+    ffmpeg = shutil.which("ffmpeg")
+    try:
+        __import__("faster_whisper")
+        faster_whisper = True
+    except ImportError:
+        faster_whisper = False
+    ok = tool is not None and script.exists() and ffmpeg is not None
+    return {
+        "ok": ok,
+        "tool_ref": tool_ref,
+        "tool_resolved": str(tool) if tool else None,
+        "script": str(script),
+        "script_exists": script.exists(),
+        "ffmpeg": ffmpeg,
+        "faster_whisper_installed": faster_whisper,
+        "model": db.runtime_str("stt_model"),
+    }
+
+
 def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> dict:
     """Run the configured STT sidecar (or return cached transcript)."""
     if dest.exists() and not force:
@@ -90,13 +133,13 @@ def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> di
 
     from . import db
 
-    python = Path(db.runtime_str("stt_python"))
+    python = _resolve_tool(db.runtime_str("stt_python"))
     script = Path(db.runtime_str("stt_sidecar"))
     model = db.runtime_str("stt_model")
-    if not python.exists():
+    if python is None:
         raise RuntimeError(
-            f"Transcription tool not found at {python}. "
-            "Pick a transcription backend on the home page (Server settings)."
+            "Transcription tool not found. "
+            "Pick a transcription backend on the settings page (Server)."
         )
     if not script.exists():
         raise RuntimeError(f"Transcription script missing: {script}")

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import shutil
 from pathlib import Path
 
 import httpx
@@ -32,7 +33,7 @@ from .feeds import (
     rewrite_feed_xml,
     slug_for_upstream,
 )
-from .process import enqueue_episode, ensure_worker
+from .process import enqueue_episode, ensure_worker, friendly_error
 from .secrets import get_app_password, password_source, set_app_password, set_zen_api_key, zen_key_status
 
 logger = logging.getLogger("podaddeduct")
@@ -47,6 +48,17 @@ async def lifespan(_: FastAPI):
     await ensure_worker()
     global _poll_task
     _poll_task = asyncio.create_task(_poll_loop())
+    try:
+        from .stt import backend_status
+
+        st = backend_status()
+        if st["ok"]:
+            logger.info("STT backend OK: tool=%s script=%s model=%s ffmpeg=%s",
+                        st["tool_resolved"], st["script"], st["model"], st["ffmpeg"])
+        else:
+            logger.warning("STT backend BROKEN: %s (see /api/health)", st)
+    except Exception:
+        logger.exception("STT self-check failed")
     yield
     if _poll_task:
         _poll_task.cancel()
@@ -417,6 +429,27 @@ async def api_storage(request: Request) -> JSONResponse:
     return JSONResponse(stats)
 
 
+@app.get("/api/health")
+async def api_health(request: Request) -> JSONResponse:
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
+    from .process import queue_depth
+    from .stt import backend_status
+
+    stt = backend_status()
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        disk = {"total": usage.total, "free": usage.free}
+    except OSError:
+        disk = {"total": None, "free": None}
+    return JSONResponse({
+        "ok": bool(stt["ok"]),
+        "stt": stt,
+        "queue_depth": queue_depth(),
+        "disk": disk,
+    })
+
+
 @app.get("/api/episodes/{episode_id}/status")
 async def api_episode_status(episode_id: int, request: Request) -> JSONResponse:
     if not _authed(request):
@@ -770,6 +803,7 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
             "key_saved": request.query_params.get("key_saved"),
             "has_clean": db.has_clean_audio(ep),
             "has_audio": bool(db.served_audio_path(ep)),
+            "friendly_error": friendly_error(ep.error),
         },
     )
 

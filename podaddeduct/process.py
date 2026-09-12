@@ -72,6 +72,26 @@ async def enqueue_episode(episode_id: int, *, reseed: bool = False, priority: bo
     return True
 
 
+def friendly_error(err: str | None) -> str:
+    """One plain sentence for the episode page. Raw traceback stays in logs/DB."""
+    text = (err or "").lower()
+    if not text.strip():
+        return ""
+    if "transcription tool not found" in text or "transcription script missing" in text:
+        return "Transcription isn't set up — check Settings → Server."
+    if "stt failed" in text or "faster_whisper" in text or "whisper" in text:
+        return "Speech-to-text failed — check server logs, then hit Prepare to retry."
+    if "zen" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
+        return "Ad detection needs a valid API key — check Settings → Ad detection."
+    if "ffmpeg" in text:
+        return "Audio cutting failed — check server logs, then hit Prepare to retry."
+    if "no space" in text or "errno 28" in text or "disk" in text:
+        return "Server disk is full — free space or lower storage limits in Settings."
+    if "download" in text or "enclosure" in text or "connect" in text or "timeout" in text:
+        return "Couldn't download the publisher's file — it usually works on retry. Hit Prepare."
+    return "Processing failed — check server logs, then hit Prepare to retry."
+
+
 async def _worker_loop() -> None:
     q = get_queue()
     while True:

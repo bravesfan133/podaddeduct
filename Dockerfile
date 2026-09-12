@@ -16,5 +16,5 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('$STT_MODEL
 
 ENV DATA_DIR=/data
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 7887
 CMD ["python", "-m", "podaddeduct"]
