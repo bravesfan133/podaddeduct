@@ -152,6 +152,36 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if ts > 0:
             conn.execute("UPDATE episodes SET pub_ts = ? WHERE id = ?", (ts, row["id"]))
     _migrate_opencode_detector(conn)
+    _migrate_opencode_http_model(conn)
+
+
+def _migrate_opencode_http_model(conn: sqlite3.Connection) -> None:
+    """Map leftover CLI / free-tier model IDs to opencode/deepseek-v4-flash."""
+    flag = conn.execute(
+        "SELECT value FROM kv WHERE key = ?", ("_migrated_opencode_http",)
+    ).fetchone()
+    if flag:
+        return
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
+    val = ((row["value"] if row else "") or "").strip()
+    if val.startswith("opencode/"):
+        stripped = val.split("/", 1)[1].strip()
+        conn.execute(
+            "UPDATE kv SET value = ? WHERE key = ?",
+            (stripped or "opencode/deepseek-v4-flash", "gemini_model"),
+        )
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
+    val = ((row["value"] if row else "") or "").strip()
+    if val in {"deepseek-v4-flash-free", "opencode/deepseek-v4-flash-free"}:
+        conn.execute(
+            "UPDATE kv SET value = ? WHERE key = ?",
+            ("opencode/deepseek-v4-flash", "gemini_model"),
+        )
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("_migrated_opencode_http", "1"),
+    )
 
 
 def _migrate_opencode_detector(conn: sqlite3.Connection) -> None:
@@ -656,8 +686,9 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (OpenCode CLI; gemini-* is an optional override)
+    # Ad detection (OpenCode serve; gemini-* is an optional override)
     "gemini_model": "",
+    "opencode_server_url": "",
     "opencode_fallback": "",
     # Transcription backend
     "stt_python": "",
@@ -679,6 +710,7 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "delete_original_after_cut": "delete_original_after_cut",
     "auto_prepare_latest": "auto_prepare_latest",
     "gemini_model": "gemini_model",
+    "opencode_server_url": "opencode_server_url",
     "opencode_fallback": "opencode_fallback",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",

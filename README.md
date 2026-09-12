@@ -12,7 +12,7 @@ cp -n .env.example .env 2>/dev/null || true
 
 Open `http://127.0.0.1:8080/`:
 
-1. **Search** for a show by name, press Add. Ad detection uses OpenCode CLI (no API key). Optional Gemini is under Settings → Ad detection → Gemini.
+1. **Search** for a show by name, press Add. Ad detection uses local `opencode serve` (`opencode/deepseek-v4-flash`). Paste your Zen key in Settings. Optional Gemini is under Settings → Ad detection → Gemini.
 2. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
 3. **Play.** New episodes prepare automatically; first play waits until the clean file is ready (never streams the with-ads original). Afterwards it's instant.
 
@@ -34,16 +34,20 @@ Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
 2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
-3. Cheap **sponsor-read heuristics**, then **OpenCode** (`opencode/deepseek-v4-flash-free`, with `opencode/nemotron-3-ultra-free` fallback) in one shot.
+3. Cheap **sponsor-read heuristics**, then **OpenCode serve** (`opencode/deepseek-v4-flash`) in one shot.
 4. Snap to silence, cut with ffmpeg (ID3 tags and cover art preserved).
 
 Everything is configured in **Settings** — no config files needed:
 
-- **Ad detection:** Test talks to OpenCode. Gemini key is optional and only used if you set a `gemini-*` model.
+- **Ad detection:** paste a Zen key once. Test pings `opencode serve` (`GET /global/health`) then a tiny session message. Gemini key is optional and only used if you set a `gemini-*` model.
 - **Server:** transcription backend (Mac Parakeet / Linux faster-whisper / optional Groq Whisper), Groq key for cloud STT only, public address for Overcast, family password.
 - **Processing:** how many episodes to prepare, shortest ad to cut.
 
-If OpenCode isn't installed, obvious sponsor-read phrases ("sponsored by", promo codes, etc.) are still cut via heuristics.
+The app starts `opencode serve --hostname 127.0.0.1 --port 4096` if the CLI is on PATH. You can also start it yourself. If serve is down, obvious sponsor-read phrases ("sponsored by", promo codes, etc.) are still cut via heuristics. Optional live check:
+
+```bash
+./scripts/test_zen_ad_detection.sh
+```
 
 ## Home server (Docker)
 
@@ -54,6 +58,8 @@ docker compose up -d --build
 ```
 
 Data (DB, audio, transcripts) lives in the `podaddeduct-data` volume. The app serves port **7887**: point your Cloudflare Tunnel hostname at `http://localhost:7887` (tunnel on the same machine) and set that `https://…` URL as the public address in Settings.
+
+The image includes the OpenCode CLI and starts `opencode serve` in the same container (no second Compose service). Paste the Zen key in Settings, or set `ZEN_API_KEY`. If serve already runs on the host instead, set `OPENCODE_SERVER_URL` (e.g. `http://172.17.0.1:4096`).
 
 ## Outside home Wi-Fi / Overcast
 

@@ -298,6 +298,8 @@ def friendly_error(err: str | None) -> str:
         return "Transcription isn't set up — check Settings → Server."
     if "stt failed" in text or "faster_whisper" in text or "whisper" in text:
         return "Speech-to-text failed — check server logs, then hit Prepare to retry."
+    if "opencode serve" in text or "opencode server is not running" in text:
+        return "Ad detection needs OpenCode serve — check Settings → Ad detection."
     if "gemini" in text and ("key" in text or "401" in text or "403" in text or "auth" in text or "api key" in text):
         return "Ad detection needs a valid Gemini API key — check Settings → Ad detection."
     if "ffmpeg" in text:
@@ -486,7 +488,7 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     if detection.gemini_error and not detection.gemini_ok:
         warn = (
             "AI ad detection failed — only obvious sponsor phrases were used. "
-            "Press Re-check after fixing your Gemini key / rate limit. "
+            "Press Re-check after OpenCode serve is healthy (Settings → Ad detection). "
             f"({detection.gemini_error[:180]})"
         )
     elif detection.gemini_error:

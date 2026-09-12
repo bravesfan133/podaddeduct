@@ -1,7 +1,11 @@
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
+# OpenCode CLI for `opencode serve` (same container, not a second Compose service).
+RUN curl -fsSL https://opencode.ai/install | bash
+ENV PATH="/root/.opencode/bin:${PATH}"
 
 WORKDIR /app
 COPY requirements.txt requirements-server.txt ./

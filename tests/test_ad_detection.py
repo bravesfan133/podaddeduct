@@ -144,25 +144,54 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    assert seed_mod.gemini_model() == "opencode/deepseek-v4-flash-free"
-    db.set_global_settings({"gemini_model": "opencode/nemotron-3-ultra-free"})
-    assert seed_mod.gemini_model() == "opencode/nemotron-3-ultra-free"
+    assert seed_mod.gemini_model() == "opencode/deepseek-v4-flash"
+    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
+    assert seed_mod.gemini_model() == "opencode/deepseek-v4-flash"
 
 
-def test_opencode_fallback_chain_on_failure(tmp_path, monkeypatch):
+def _ok_serve_text(text):
+    return _FakeResp(200, {"parts": [{"type": "text", "text": text}]})
+
+
+class _ServeClient:
+    """httpx.Client stand-in for opencode serve (GET/POST/DELETE)."""
+
+    def __init__(self, ads_json='{"ads": []}'):
+        self.ads_json = ads_json
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return _FakeResp(200, {"healthy": True, "version": "test"})
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        if url.rstrip("/").endswith("/session"):
+            return _FakeResp(200, {"id": "ses_test"})
+        if "/message" in url:
+            return _ok_serve_text(self.ads_json)
+        return _FakeResp(404, text="unexpected post")
+
+    def delete(self, url, **kwargs):
+        self.calls.append(("DELETE", url, kwargs))
+        return _FakeResp(200, True)
+
+    def put(self, url, **kwargs):
+        self.calls.append(("PUT", url, kwargs))
+        return _FakeResp(200, {"ok": True})
+
+
+def test_opencode_serve_posts_deepseek_v4_flash(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    calls = []
-
-    def fake_oc(prompt, model=None):
-        calls.append(model)
-        if model == "opencode/deepseek-v4-flash-free":
-            raise RuntimeError("server error")
-        return '{"ads": [{"start": "00:00:10", "end": "00:00:40"}]}'
-
-    # Bypass the internal multi-model loop by mocking opencode_generate's
-    # lower-level path via find_ads_with_opencode's call.
+    fake = _ServeClient('{"ads": [{"start": "00:00:10", "end": "00:00:40"}]}')
     transcript = {
         "sentences": [
             {"text": "Welcome back to the show.", "start": 0.0, "end": 4.0},
@@ -170,25 +199,63 @@ def test_opencode_fallback_chain_on_failure(tmp_path, monkeypatch):
         ]
     }
 
-    def fake_run(cmd, **kwargs):
-        model = cmd[cmd.index("-m") + 1] if "-m" in cmd else ""
-        calls.append(model)
-        class P:
-            returncode = 1 if "deepseek" in model else 0
-            stdout = '{"ads": [{"start": "00:00:10", "end": "00:00:40"}]}' if "deepseek" not in model else ""
-            stderr = "fail" if "deepseek" in model else ""
-        return P()
+    def no_subproc(*a, **k):
+        raise AssertionError(f"must not spawn subprocess: {a}")
 
     with (
-        patch.object(seed_mod, "get_opencode_bin", return_value="/usr/bin/opencode"),
-        patch("subprocess.run", side_effect=fake_run),
-        patch.object(seed_mod, "gemini_model", return_value="opencode/deepseek-v4-flash-free"),
+        patch.object(seed_mod.httpx, "Client", return_value=fake),
+        patch("subprocess.run", side_effect=no_subproc),
+        patch("subprocess.Popen", side_effect=no_subproc),
     ):
         result = seed_mod.find_ads_with_gemini(transcript)
     assert result.gemini_ok
     assert len(result.ranges) == 1
-    assert "opencode/deepseek-v4-flash-free" in calls
-    assert any("nemotron" in c or "mimo" in c for c in calls)
+    posts = [c for c in fake.calls if c[0] == "POST"]
+    msg = [c for c in posts if "/message" in c[1]]
+    sess = [c for c in posts if c[1].rstrip("/").endswith("/session")]
+    assert sess and msg
+    body = msg[0][2]["json"]
+    assert body["model"]["providerID"] == "opencode"
+    assert body["model"]["modelID"] == "deepseek-v4-flash"
+    assert "car commercial" in body["parts"][0]["text"]
+    assert "car commercial" not in body["system"]
+    assert "advertisement detection" in body["system"].lower()
+    assert body["tools"] == {"bash": False, "edit": False, "write": False, "read": False}
+    assert not any("opencode.ai" in c[1] for c in fake.calls)
+    assert not any("zen/v1" in c[1] for c in fake.calls)
+    assert not any("opencode run" in str(c) for c in fake.calls)
+    assert any(c[0] == "DELETE" and "/session/" in c[1] for c in fake.calls)
+
+
+def test_opencode_generate_surfaces_assistant_error(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    class _ErrClient(_ServeClient):
+        def post(self, url, **kwargs):
+            self.calls.append(("POST", url, kwargs))
+            if url.rstrip("/").endswith("/session"):
+                return _FakeResp(200, {"id": "ses_err"})
+            if "/message" in url:
+                return _FakeResp(
+                    200,
+                    {
+                        "info": {
+                            "role": "assistant",
+                            "error": {
+                                "name": "APIError",
+                                "data": {"message": "Insufficient balance."},
+                            },
+                        },
+                        "parts": [],
+                    },
+                )
+            return _FakeResp(404, text="unexpected post")
+
+    fake = _ErrClient()
+    with patch.object(seed_mod.httpx, "Client", return_value=fake):
+        with pytest.raises(RuntimeError, match="Insufficient balance"):
+            seed_mod.opencode_generate("hi")
 
 
 def test_find_ads_uses_opencode(tmp_path, monkeypatch):
@@ -199,18 +266,15 @@ def test_find_ads_uses_opencode(tmp_path, monkeypatch):
                                 {"text": "Midroll car commercial here.", "start": 4.0, "end": 30.0}]}
     calls = []
 
-    def fake_oc(prompt, model=None):
+    def fake_oc(user_content, model=None, **kwargs):
         calls.append(model)
         return '{"ads": [{"start": "00:00:04", "end": "00:00:30"}]}'
 
-    with (
-        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
-    ):
+    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
         result = seed_mod.find_ads_with_zen(transcript)
     assert len(result.ranges) == 1
     assert result.gemini_ok
-    assert calls and calls[0] == "opencode/deepseek-v4-flash-free"
+    assert calls and "deepseek-v4-flash" in (calls[0] or "")
 
 
 def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
@@ -225,14 +289,13 @@ def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
     }
     with (
         patch.object(seed_mod, "resolve_gemini_api_key", return_value=None),
-        patch.object(seed_mod, "is_opencode_available", return_value=False),
+        patch.object(seed_mod, "opencode_generate", side_effect=RuntimeError("serve down")),
         patch.object(seed_mod, "gemini_model", return_value="gemini-2.5-flash"),
     ):
         result = seed_mod.find_ads_with_zen(transcript)
     assert len(result.ranges) >= 1
     assert result.ranges[0].start <= 4.5
     assert result.gemini_ok is False
-    assert result.gemini_error is None
 
 
 def test_find_ads_gemini_soft_fails_to_heuristics(tmp_path, monkeypatch):
@@ -252,7 +315,7 @@ def test_find_ads_gemini_soft_fails_to_heuristics(tmp_path, monkeypatch):
     with (
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "gemini_model", return_value="gemini-2.5-flash"),
-        patch.object(seed_mod, "is_opencode_available", return_value=False),
+        patch.object(seed_mod, "opencode_generate", side_effect=RuntimeError("serve down")),
         patch.object(seed_mod, "_gemini_generate", side_effect=boom),
     ):
         result = seed_mod.find_ads_with_zen(transcript)
@@ -286,7 +349,7 @@ def test_micro_cuts_filtered_when_gemini_fails(tmp_path, monkeypatch):
     with (
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "gemini_model", return_value="gemini-2.5-flash"),
-        patch.object(seed_mod, "is_opencode_available", return_value=False),
+        patch.object(seed_mod, "opencode_generate", side_effect=RuntimeError("serve down")),
         patch.object(seed_mod, "_gemini_generate", side_effect=boom),
     ):
         result = seed_mod.find_ads_with_zen(transcript)
@@ -316,8 +379,8 @@ def test_full_transcript_opencode_ad_detection(tmp_path, monkeypatch):
 
     bodies = []
 
-    def fake_oc(prompt, model=None):
-        bodies.append(prompt)
+    def fake_oc(user_content, model=None, **kwargs):
+        bodies.append(user_content)
         return json.dumps({
             "ads": [
                 {"start": "00:00:40", "end": "00:01:40", "type": "inserted_ad", "sponsor": "unknown", "confidence": 0.9},
@@ -326,10 +389,7 @@ def test_full_transcript_opencode_ad_detection(tmp_path, monkeypatch):
         })
 
     seen_progress = []
-    with (
-        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
-    ):
+    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
         result = seed_mod.find_ads_with_gemini(
             transcript, progress_cb=lambda d, tot: seen_progress.append((d, tot))
         )
@@ -397,11 +457,11 @@ def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "gemini_model": "opencode/deepseek-v4-flash-free"},
+            data={"settings_form": "1", "gemini_model": "opencode/deepseek-v4-flash"},
             follow_redirects=False,
         )
         assert r.status_code == 303
-    assert db.runtime_str("gemini_model") == "opencode/deepseek-v4-flash-free"
+    assert db.runtime_str("gemini_model") == "opencode/deepseek-v4-flash"
 
 
 def test_opencode_direct_routing(tmp_path, monkeypatch):
@@ -414,7 +474,7 @@ def test_opencode_direct_routing(tmp_path, monkeypatch):
             {"text": "Ad here.", "start": 10.0, "end": 40.0},
         ]
     }
-    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash-free"})
+    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
 
     with patch.object(
         seed_mod,
@@ -426,7 +486,7 @@ def test_opencode_direct_routing(tmp_path, monkeypatch):
     assert len(res.ranges) == 1
     assert res.ranges[0].start == 10.0
     mock_gen.assert_called_once()
-    assert mock_gen.call_args[1]["model"] == "opencode/deepseek-v4-flash-free"
+    assert mock_gen.call_args[1]["model"] == "opencode/deepseek-v4-flash"
 
 
 def test_gemini_quota_falls_back_to_opencode(tmp_path, monkeypatch):
@@ -447,7 +507,6 @@ def test_gemini_quota_falls_back_to_opencode(tmp_path, monkeypatch):
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "gemini_model", return_value="gemini-2.5-flash"),
         patch.object(seed_mod, "_gemini_generate", side_effect=boom),
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
         patch.object(
             seed_mod,
             "opencode_generate",
@@ -507,7 +566,6 @@ def test_connection_test_uses_opencode_even_when_gemini_key_exists(tmp_path, mon
     from podaddeduct import seed as seed_mod
 
     with (
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
         patch.object(seed_mod, "opencode_generate", return_value='{"ads": []}'),
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-must-not-use"),
         patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
@@ -517,16 +575,18 @@ def test_connection_test_uses_opencode_even_when_gemini_key_exists(tmp_path, mon
     assert out["provider"] == "opencode"
 
 
-def test_connection_test_missing_opencode_does_not_use_gemini_key(tmp_path, monkeypatch):
+def test_connection_test_serve_down_does_not_use_gemini_key(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
+    from podaddeduct import opencode_server as oc
     from podaddeduct import seed as seed_mod
 
     with (
-        patch.object(seed_mod, "is_opencode_available", return_value=False),
+        patch.object(oc, "serve_health", return_value={"ok": False, "error": "OpenCode server is not running."}),
+        patch.object(oc, "ensure_opencode_serve", return_value={"ok": False, "error": "OpenCode server is not running."}),
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
     ):
         out = seed_mod.test_gemini_connection()
     assert out["ok"] is False
     assert out["provider"] == "opencode"
-    assert "OpenCode CLI not found" in out["error"]
+    assert "not running" in out["error"]

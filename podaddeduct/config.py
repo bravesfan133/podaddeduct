@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # Optional shared password when exposed via tunnel (empty = no login locally).
     app_password: str = ""
 
-    # Local Parakeet (Mac) / faster-whisper (Linux) + OpenCode CLI for ads.
+    # Local Parakeet (Mac) / faster-whisper (Linux) + OpenCode serve for ads.
     stt_python: str = "./.venv-stt/bin/python"
     stt_sidecar: str = "./scripts/stt_sidecar.py"
     stt_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -57,7 +57,12 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
     )
-    gemini_model: str = "opencode/deepseek-v4-flash-free"
+    gemini_model: str = "opencode/deepseek-v4-flash"
+    opencode_server_url: str = "http://127.0.0.1:4096"
+    zen_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ZEN_API_KEY", "OPENCODE_API_KEY", "zen_api_key"),
+    )
     opencode_fallback: bool = True
     silence_snap_window: float = 2.0
 

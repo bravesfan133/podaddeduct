@@ -143,7 +143,6 @@ def test_ad_detection_test_defaults_to_opencode(tmp_path, monkeypatch):
     from podaddeduct.app import app
 
     with (
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
         patch.object(seed_mod, "opencode_generate", return_value='{"ads": []}'),
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-must-not-use"),
         patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
@@ -174,6 +173,26 @@ def test_ad_detection_test_gemini_model_without_key(tmp_path, monkeypatch):
         assert "Gemini API key" in body["error"]
 
 
+def test_ad_detection_test_serve_down(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import opencode_server as oc
+    from podaddeduct import seed as seed_mod
+    from podaddeduct.app import app
+
+    with (
+        patch.object(oc, "serve_health", return_value={"ok": False, "error": "OpenCode server is not running."}),
+        patch.object(oc, "ensure_opencode_serve", return_value={"ok": False, "error": "OpenCode server is not running."}),
+        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
+        TestClient(app) as client,
+    ):
+        r = client.post("/api/gemini-test", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is False
+        assert body["provider"] == "opencode"
+        assert "not running" in body["error"]
+
+
 def test_settings_page_renders(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct.app import app
@@ -185,7 +204,25 @@ def test_settings_page_renders(tmp_path, monkeypatch):
             assert section in r.text, section
         assert "adDetectionTest" in r.text
         assert "geminiTest" not in r.text
-        assert "Test talks to OpenCode" in r.text
+        assert "opencode serve" in r.text
+        assert "opencode/deepseek-v4-flash" in r.text
+        assert "opencodeHealthWarn" not in r.text
+
+
+def test_settings_page_warns_when_serve_down(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import opencode_server as oc
+    from podaddeduct.app import app
+
+    with (
+        patch.object(oc, "serve_health", return_value={"ok": False, "error": "OpenCode server is not running."}),
+        TestClient(app) as client,
+    ):
+        r = client.get("/settings")
+        assert r.status_code == 200
+        assert "opencodeHealthWarn" in r.text
+        assert "OpenCode server is not running" in r.text
+        assert "opencode serve --hostname 127.0.0.1 --port 4096" in r.text
 
 
 def test_mutating_routes_need_login(tmp_path, monkeypatch):
@@ -198,6 +235,7 @@ def test_mutating_routes_need_login(tmp_path, monkeypatch):
         with TestClient(app, follow_redirects=False) as client:
             assert client.post("/settings/global", data={}).status_code == 303
             assert client.post("/feeds", data={"upstream_url": "https://x.test/rss"}).status_code == 303
+            assert client.post("/settings/zen-key", data={}).status_code == 303
             assert client.post("/settings/gemini-key", data={}).status_code == 303
             assert client.post("/import-opml", files={"file": ("a.opml", b"<opml/>")}).status_code == 303
             assert client.get("/api/search?q=x").status_code == 401

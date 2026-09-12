@@ -83,8 +83,47 @@ def gemini_key_status() -> dict:
         "configured": bool(stored or env),
         "source": source,
         "hint": hint,
-        "model": _db.runtime_str("gemini_model") or "opencode/deepseek-v4-flash-free",
+        "model": _db.runtime_str("gemini_model") or "opencode/deepseek-v4-flash",
     }
+
+
+def get_zen_api_key() -> str | None:
+    """UI-saved Zen key first, then ZEN_API_KEY / OPENCODE_API_KEY env."""
+    stored = (load_secrets().get("zen_api_key") or "").strip()
+    if stored:
+        return stored
+    env = (settings.zen_api_key or "").strip()
+    if env:
+        return env
+    for name in ("ZEN_API_KEY", "OPENCODE_API_KEY"):
+        val = (os.environ.get(name) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def set_zen_api_key(key: str | None) -> None:
+    key = (key or "").strip()
+    save_secrets({"zen_api_key": key or None})
+
+
+def zen_key_status() -> dict:
+    stored = (load_secrets().get("zen_api_key") or "").strip()
+    env = (settings.zen_api_key or "").strip()
+    if not env:
+        for name in ("ZEN_API_KEY", "OPENCODE_API_KEY"):
+            env = (os.environ.get(name) or "").strip()
+            if env:
+                break
+    source = None
+    hint = ""
+    if stored:
+        source = "ui"
+        hint = stored[:6] + "…" + stored[-4:] if len(stored) > 12 else "••••"
+    elif env:
+        source = "env"
+        hint = env[:6] + "…" + env[-4:] if len(env) > 12 else "••••"
+    return {"configured": bool(stored or env), "source": source, "hint": hint}
 
 
 def get_groq_api_key() -> str | None:

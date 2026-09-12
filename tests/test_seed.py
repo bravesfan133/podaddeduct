@@ -93,14 +93,11 @@ def test_find_ads_with_gemini_mocked():
 
     seen_bodies = []
 
-    def fake_oc(prompt, model=None):
-        seen_bodies.append(prompt)
+    def fake_oc(user_content, model=None, **kwargs):
+        seen_bodies.append(user_content)
         return '{"ads": [{"start": "00:06:40", "end": "00:07:25", "type": "inserted_ad", "sponsor": "unknown", "confidence": 0.9}]}'
 
-    with (
-        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
-    ):
+    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
         result = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
     ads = result.ranges
     # Full transcript (including heuristic-covered sponsor lines) goes to the model.
@@ -168,7 +165,7 @@ def test_find_ads_progress_callback():
 
     seen = []
 
-    def fake_oc(prompt, model=None):
+    def fake_oc(user_content, model=None, **kwargs):
         return '{"ads": []}'
 
     # Transcript with no heuristic hits so the model runs once.
@@ -180,10 +177,7 @@ def test_find_ads_progress_callback():
         ]
     }
 
-    with (
-        patch.object(seed_mod, "opencode_generate", side_effect=fake_oc),
-        patch.object(seed_mod, "is_opencode_available", return_value=True),
-    ):
+    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
         seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
     assert seen[-1][0] == seen[-1][1]
@@ -193,4 +187,4 @@ def test_default_gemini_model():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["gemini_model"].default
-    assert default == "opencode/deepseek-v4-flash-free"
+    assert default == "opencode/deepseek-v4-flash"

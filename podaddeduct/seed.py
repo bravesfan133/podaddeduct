@@ -17,9 +17,12 @@ logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
-GEMINI_FALLBACK_MODEL = "opencode/nemotron-3-ultra-free"
+GEMINI_DEFAULT_MODEL = "opencode/deepseek-v4-flash"
+GEMINI_FALLBACK_MODEL = "opencode/deepseek-v4-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+OPENCODE_DEFAULT_MODEL = "deepseek-v4-flash"
+OPENCODE_PROVIDER = "opencode"
+OPENCODE_MESSAGE_TIMEOUT = 300.0
 GEMINI_MAX_TRIES = 5
 GEMINI_MAX_OUTPUT_TOKENS = 8192
 
@@ -557,82 +560,104 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
     raise RuntimeError(f"Gemini failed after {GEMINI_MAX_TRIES} tries: {last_err}")
 
 
-OPENCODE_DEFAULT_MODELS = [
-    "opencode/deepseek-v4-flash-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/mimo-v2.5-free",
-]
+def split_opencode_model(model: str | None) -> tuple[str, str]:
+    raw = (model or "").strip() or f"{OPENCODE_PROVIDER}/{OPENCODE_DEFAULT_MODEL}"
+    if raw.startswith("opencode/"):
+        raw = raw.split("/", 1)[1].strip() or OPENCODE_DEFAULT_MODEL
+    if "/" in raw and not raw.startswith("gemini"):
+        provider, model_id = raw.split("/", 1)
+        return provider.strip() or OPENCODE_PROVIDER, model_id.strip() or OPENCODE_DEFAULT_MODEL
+    return OPENCODE_PROVIDER, raw or OPENCODE_DEFAULT_MODEL
 
 
-def get_opencode_bin() -> str | None:
-    """Find opencode CLI binary in PATH or standard user install locations."""
-    import os
-    import shutil
-
-    b = shutil.which("opencode")
-    if b:
-        return b
-    home_bin = os.path.expanduser("~/.opencode/bin/opencode")
-    if os.path.isfile(home_bin) and os.access(home_bin, os.X_OK):
-        return home_bin
-    return None
+def _session_id(data) -> str:
+    if isinstance(data, dict):
+        sid = data.get("id") or (data.get("info") or {}).get("id")
+        if sid:
+            return str(sid)
+    raise RuntimeError(f"OpenCode serve did not return a session id: {data!r}"[:240])
 
 
-def is_opencode_available() -> bool:
-    return get_opencode_bin() is not None
+def _assistant_error(payload: dict) -> str | None:
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    err = info.get("error")
+    if not err:
+        return None
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        msg = data.get("message") or err.get("name") or str(err)
+        return str(msg)
+    return str(err)
 
 
-def _models_to_try(model: str | None = None) -> list[str]:
-    models_to_try: list[str] = []
-    if (model or "").strip():
-        models_to_try.append(model.strip())
-    for m in OPENCODE_DEFAULT_MODELS:
-        if m not in models_to_try:
-            models_to_try.append(m)
-    return models_to_try
+def _text_from_message(payload) -> str:
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenCode serve returned a non-object message")
+    err = _assistant_error(payload)
+    if err:
+        raise RuntimeError(f"OpenCode API error: {err}")
+    parts = payload.get("parts")
+    if not isinstance(parts, list):
+        raise RuntimeError("OpenCode serve message has no parts")
+    texts = [
+        str(p.get("text") or "")
+        for p in parts
+        if isinstance(p, dict) and p.get("type") == "text"
+    ]
+    out = "\n".join(t for t in texts if t).strip()
+    if not out:
+        raise RuntimeError("OpenCode serve returned no text parts")
+    return out
 
 
-def opencode_generate(prompt: str, model: str | None = None) -> str:
-    """Invoke opencode CLI runner to generate JSON response."""
-    import subprocess
+def opencode_generate(user_content: str, model: str | None = None, *, system: str | None = None) -> str:
+    """Talk to local `opencode serve`. Never runs `opencode run` or calls zen/v1."""
+    from .opencode_server import ensure_opencode_serve, opencode_server_url
 
-    bin_path = get_opencode_bin()
-    if not bin_path:
-        raise RuntimeError("opencode CLI not found in PATH")
-
-    models_to_try = _models_to_try(model)
-    last_err = ""
-
-    for m in models_to_try:
-        cmd = [bin_path, "run", prompt, "-m", m, "--pure"]
+    health = ensure_opencode_serve()
+    if not health.get("ok"):
+        raise RuntimeError(
+            health.get("error")
+            or "OpenCode server is not running. podaddeduct starts `opencode serve` automatically if the CLI is installed."
+        )
+    base = opencode_server_url()
+    provider_id, model_id = split_opencode_model(model)
+    session_id = None
+    with httpx.Client(timeout=OPENCODE_MESSAGE_TIMEOUT) as client:
+        created = client.post(f"{base}/session", json={"title": "podaddeduct ads"})
+        if created.status_code >= 400:
+            raise RuntimeError(f"OpenCode session create failed: {created.status_code} {created.text[:200]}")
+        session_id = _session_id(created.json())
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            last_err = f"opencode timed out after 300s on {m}"
-            logger.warning(last_err)
-            continue
-        if proc.returncode == 0:
-            logger.info("opencode succeeded with model %s", m)
-            return proc.stdout
-        err_msg = (proc.stderr or proc.stdout or "").strip()
-        last_err = f"{m} failed ({proc.returncode}): {err_msg[:200]}"
-        logger.warning("opencode attempt failed: %s; trying next model", last_err)
-
-    raise RuntimeError(f"opencode failed: {last_err}")
+            body = {
+                "model": {"providerID": provider_id, "modelID": model_id},
+                "system": system or SYSTEM_PROMPT,
+                "tools": {"bash": False, "edit": False, "write": False, "read": False},
+                "parts": [{"type": "text", "text": user_content}],
+            }
+            resp = client.post(f"{base}/session/{session_id}/message", json=body)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"OpenCode API error: {resp.status_code} {resp.text[:300]}")
+            return _text_from_message(resp.json())
+        finally:
+            if session_id:
+                try:
+                    client.delete(f"{base}/session/{session_id}")
+                except Exception:
+                    pass
+    raise RuntimeError("OpenCode serve returned no content")
 
 
 def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDetectionResult:
-    """Run ad detection via opencode CLI on full transcript."""
+    """Run ad detection via opencode serve on the full transcript."""
     body = format_timestamped_transcript(transcript)
     if not body.strip():
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
 
-    prompt = SYSTEM_PROMPT + "\n\nTIMESTAMPED TRANSCRIPT:\n\n" + body
     try:
-        raw = opencode_generate(prompt, model=model)
+        raw = opencode_generate(body, model=model, system=SYSTEM_PROMPT)
         parsed = _extract_ads_payload(raw)
-        logger.info("opencode ad detection -> %d ranges", len(parsed))
+        logger.info("opencode serve ad detection -> %d ranges", len(parsed))
         ranges = merge_intervals(
             [Interval(float(r["start"]), float(r["end"])) for r in parsed],
             gap=NEARBY_AD_GAP_SECONDS,
@@ -644,7 +669,7 @@ def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDete
 
 
 def test_gemini_connection(model: str | None = None) -> dict:
-    """Prove the configured ad detector works. OpenCode unless model is gemini-*."""
+    """Prove the configured ad detector works. OpenCode serve unless model is gemini-*."""
     use_model = (model or "").strip() or gemini_model()
     try:
         if is_gemini_model(use_model):
@@ -654,7 +679,7 @@ def test_gemini_connection(model: str | None = None) -> dict:
                     "ok": False,
                     "provider": "gemini",
                     "model": use_model,
-                    "error": "No Gemini API key. OpenCode is the default detector — a gemini-* model is the only thing that uses this key.",
+                    "error": "No Gemini API key. OpenCode serve is the default detector — a gemini-* model is the only thing that uses this key.",
                 }
             start = time.monotonic()
             raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
@@ -667,24 +692,33 @@ def test_gemini_connection(model: str | None = None) -> dict:
                 "ms": ms,
                 "ranges": len(parsed),
             }
-        if not is_opencode_available():
+        from .opencode_server import serve_health
+
+        health = serve_health()
+        if not health.get("ok"):
+            from .opencode_server import ensure_opencode_serve
+
+            health = ensure_opencode_serve()
+        if not health.get("ok"):
             return {
                 "ok": False,
                 "provider": "opencode",
                 "model": use_model,
-                "error": "OpenCode CLI not found. Install opencode, then Test again.",
+                "error": health.get("error") or "OpenCode server is not running.",
             }
         start = time.monotonic()
         raw = opencode_generate(
-            'Return ONLY valid JSON: {"ads": []}',
-            model=use_model if use_model.startswith("opencode") else None,
+            "[00:00:00 - 00:00:04] Welcome to the show.",
+            model=use_model,
+            system=SYSTEM_PROMPT,
         )
         parsed = _extract_ads_payload(raw)
         ms = int((time.monotonic() - start) * 1000)
+        provider_id, model_id = split_opencode_model(use_model)
         return {
             "ok": True,
             "provider": "opencode",
-            "model": use_model,
+            "model": f"{provider_id}/{model_id}",
             "ms": ms,
             "ranges": len(parsed),
         }
@@ -749,32 +783,25 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
 
 
 def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """One-shot AI ad detection on full transcript using OpenCode (default) or Gemini."""
+    """One-shot AI ad detection via OpenCode serve (default) or Gemini."""
     model = gemini_model()
 
-    # OpenCode is the default path — model IDs start with "opencode".
-    if model.startswith("opencode") or (not resolve_gemini_api_key() and is_opencode_available()):
+    if not is_gemini_model(model):
         if progress_cb is not None:
             progress_cb(0, 1)
-        res = find_ads_with_opencode(
-            transcript,
-            model=model if model.startswith("opencode") else None,
-        )
+        res = find_ads_with_opencode(transcript, model=model)
         if progress_cb is not None:
             progress_cb(1, 1)
         return res
 
     api_key = resolve_gemini_api_key()
     if not api_key:
-        if is_opencode_available():
-            if progress_cb is not None:
-                progress_cb(0, 1)
-            res = find_ads_with_opencode(transcript)
-            if progress_cb is not None:
-                progress_cb(1, 1)
-            return res
-        logger.info("No Gemini API key / OpenCode CLI; skipping LLM ad detection")
-        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=False)
+        if progress_cb is not None:
+            progress_cb(0, 1)
+        res = find_ads_with_opencode(transcript)
+        if progress_cb is not None:
+            progress_cb(1, 1)
+        return res
 
     body = format_timestamped_transcript(transcript)
     if not body.strip():
@@ -795,14 +822,12 @@ def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResul
         err_text = str(primary_exc)
         last_err = err_text[-300:]
         logger.warning("Gemini ad detection failed: %s", primary_exc)
-
-        if is_opencode_available():
-            logger.warning("Gemini failed (%s); attempting OpenCode CLI backup", last_err)
-            opencode_res = find_ads_with_opencode(transcript)
-            if opencode_res.gemini_ok:
-                if progress_cb is not None:
-                    progress_cb(1, 1)
-                return opencode_res
+        logger.warning("Gemini failed (%s); attempting OpenCode serve backup", last_err)
+        opencode_res = find_ads_with_opencode(transcript)
+        if opencode_res.gemini_ok:
+            if progress_cb is not None:
+                progress_cb(1, 1)
+            return opencode_res
 
     if progress_cb is not None:
         progress_cb(1, 1)
