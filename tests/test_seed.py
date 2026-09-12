@@ -89,7 +89,10 @@ def test_leftover_transcript_drops_covered():
 def test_find_ads_with_gemini_mocked():
     from podaddeduct import seed as seed_mod
 
+    seen_bodies = []
+
     def fake_gemini(api_key, model, user_content):
+        seen_bodies.append(user_content)
         if "Midroll" in user_content or "car commercial" in user_content:
             return '[{"start": 400.0, "end": 445.0}]'
         return "[]"
@@ -99,10 +102,50 @@ def test_find_ads_with_gemini_mocked():
         patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
     ):
         ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
-    # Heuristic covers the sponsor block; Gemini covers midroll leftover.
+    # Full transcript (including heuristic-covered sponsor lines) goes to Gemini.
+    assert seen_bodies and "brought to you" in seen_bodies[0]
+    assert "Midroll" in seen_bodies[0]
+    # Heuristic covers the sponsor block; Gemini covers midroll.
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
+
+
+def test_pad_and_clamp_ads_pre_and_postroll():
+    from podaddeduct.seed import pad_and_clamp_ads
+
+    # Early ad snaps to 0; padding extends the end.
+    early = pad_and_clamp_ads([Interval(5.0, 20.0)], duration=600.0)
+    assert len(early) == 1
+    assert early[0].start == 0.0
+    assert early[0].end >= 20.5
+
+    # Late ad clamps through end of episode.
+    late = pad_and_clamp_ads([Interval(560.0, 580.0)], duration=600.0)
+    assert len(late) == 1
+    assert late[0].end == 600.0
+    assert late[0].start <= 559.8
+
+    # Short fixtures must not wipe the whole clip via post-roll clamp.
+    short = pad_and_clamp_ads([Interval(2.5, 7.5)], duration=10.0)
+    assert len(short) == 1
+    assert short[0].end < 10.0 or short[0].start == 0.0
+    assert short[0].duration < 10.0
+
+
+def test_heuristic_ads_finds_sports_cues():
+    transcript = {
+        "sentences": [
+            {"text": "Welcome back.", "start": 0.0, "end": 3.0},
+            {"text": "This episode is presented by FanDuel.", "start": 3.0, "end": 12.0},
+            {"text": "If you or someone you know has a gambling problem call 1-800-GAMBLER.", "start": 12.0, "end": 25.0},
+            {"text": "Back to the Celtics.", "start": 25.0, "end": 30.0},
+        ]
+    }
+    ads = heuristic_ads(transcript)
+    assert len(ads) >= 1
+    assert ads[0].start <= 3.5
+    assert ads[0].end >= 24.0  # merged across the FanDuel + helpline block
 
 
 def test_find_ads_progress_callback():

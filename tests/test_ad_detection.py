@@ -156,11 +156,39 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     assert seed_mod.gemini_model() == "gemini-2.0-flash"
 
 
+def test_gemini_503_falls_back_to_flash(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    calls = []
+
+    def fake_gemini(api_key, model, user_content):
+        calls.append(model)
+        if model == seed_mod.GEMINI_DEFAULT_MODEL:
+            raise RuntimeError("503 This model is currently experiencing high demand.")
+        return '[{"start": 10.0, "end": 40.0}]'
+
+    transcript = {
+        "sentences": [
+            {"text": "Welcome back to the show.", "start": 0.0, "end": 4.0},
+            {"text": "Midroll car commercial here.", "start": 10.0, "end": 40.0},
+        ]
+    }
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
+    ):
+        ads = seed_mod.find_ads_with_gemini(transcript)
+    assert len(ads) == 1
+    assert calls == [seed_mod.GEMINI_DEFAULT_MODEL, seed_mod.GEMINI_FALLBACK_MODEL]
+    assert ads[0].start == 10.0
+
+
 def test_find_ads_uses_gemini(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    # No heuristic hits so Gemini runs on leftovers.
+    # No heuristic hits so Gemini runs on the full transcript.
     transcript = {"sentences": [{"text": "Welcome back to the show.", "start": 0.0, "end": 4.0},
                                 {"text": "Midroll car commercial here.", "start": 4.0, "end": 30.0}]}
     calls = []
