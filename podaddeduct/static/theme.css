@@ -152,3 +152,95 @@ code, .url {
   gap: 1rem;
 }
 .toprow .themebar { margin-bottom: 0; }
+
+/* Live processing queue / status card */
+.queue-card h2 { margin: 0 0 0.75rem; font-size: 1.1rem; }
+.queue-idle { color: var(--muted); margin: 0; font-size: 0.9rem; }
+.queue-job { margin-bottom: 0.85rem; }
+.queue-job-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 0.75rem;
+  margin-bottom: 0.45rem;
+}
+.queue-job-title { font-weight: 600; }
+.queue-job-show { color: var(--muted); font-size: 0.85rem; }
+.queue-job-meta { color: var(--muted); font-size: 0.85rem; margin: 0.35rem 0 0; }
+.prog-track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--inset);
+  overflow: hidden;
+  margin-top: 0.45rem;
+}
+.prog-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 4px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+.prog-fill.indeterminate {
+  width: 40% !important;
+  opacity: 0.55;
+  animation: prog-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes prog-shimmer {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(280%); }
+}
+.queue-list { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.queue-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--line);
+  font-size: 0.9rem;
+}
+.queue-list li:first-child { border-top: 0; }
+.queue-pos {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  height: 1.4rem;
+  padding: 0 0.35rem;
+  border-radius: 99px;
+  background: var(--ghost-bg);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+.queue-section-label {
+  margin: 0.85rem 0 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.queue-recent { list-style: none; padding: 0; margin: 0.25rem 0 0; }
+.queue-recent li {
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+}
+.queue-recent li:first-child { border-top: 0; }
+.queue-recent .ok { color: var(--ok); }
+.mini-prog {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--inset);
+  overflow: hidden;
+  margin-top: 0.3rem;
+  max-width: 120px;
+}
+.mini-prog > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+.pill.warn { background: color-mix(in srgb, var(--warn) 22%, var(--ghost-bg)); color: var(--warn); }
+.pill.ok { background: color-mix(in srgb, var(--ok) 22%, var(--ghost-bg)); color: var(--ok); }

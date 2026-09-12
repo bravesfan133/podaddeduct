@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from podaddeduct import db
 from podaddeduct.config import settings
-from podaddeduct.feeds import parse_feed, rewrite_feed_xml
+from podaddeduct.feeds import generate_custom_feed_xml, parse_feed, rewrite_feed_xml
 from podaddeduct.intervals import Interval, invert_ranges, merge_intervals
 
 
@@ -43,3 +43,63 @@ def test_feed_rewrite_points_at_clean_audio(tmp_path, monkeypatch):
     assert 'length="100"' in xml  # clean file size, not upstream 999
     assert "<itunes:duration>300</itunes:duration>" in xml
     assert "podcast:chapters" not in xml
+
+
+def test_generate_custom_feed_ready_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    (tmp_path / "audio").mkdir()
+    db.init_db()
+    feed = db.create_feed(slug="show", upstream_url="https://example.com/rss", title="My Show")
+    db.update_feed_channel(feed.id, description="Show notes here", author="Host")
+    db.update_feed_artwork(feed.id, "https://cdn.example.com/art.jpg")
+    feed = db.get_feed(feed.id)
+    assert feed
+
+    pending = db.upsert_episode(
+        feed.id, guid="g-pending", title="Pending Ep",
+        enclosure_url="https://example.com/p.mp3",
+        pub_date="Mon, 01 Sep 2025 00:00:00 GMT",
+    )
+    ready = db.upsert_episode(
+        feed.id, guid="g-ready", title="Ready Ep",
+        enclosure_url="https://example.com/r.mp3",
+        pub_date="Tue, 02 Sep 2025 00:00:00 GMT",
+    )
+    clean = tmp_path / "audio" / f"{ready.id}.clean.mp3"
+    clean.write_bytes(b"y" * 50)
+    db.update_episode(
+        ready.id,
+        status="ready",
+        clean_audio_path=str(clean),
+        duration_seconds=120.0,
+        description="Episode show notes",
+        size_bytes=50,
+    )
+    ready = db.get_episode(ready.id)
+    assert ready
+
+    ready_eps = db.list_ready_episodes(feed.id)
+    assert [e.guid for e in ready_eps] == ["g-ready"]
+    assert pending.id not in {e.id for e in ready_eps}
+
+    xml = generate_custom_feed_xml(feed, ready_eps, "http://192.168.0.93:8080")
+    assert "<title>My Show</title>" in xml
+    assert "Show notes here" in xml
+    assert 'href="https://cdn.example.com/art.jpg"' in xml
+    assert "Ready Ep" in xml
+    assert "Pending Ep" not in xml
+    assert f"/audio/{ready.id}" in xml
+    assert 'length="50"' in xml
+    assert "<itunes:duration>120</itunes:duration>" in xml
+    assert "Episode show notes" in xml
+    assert xml.count("<item>") == 1
+
+
+def test_generate_custom_feed_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    (tmp_path / "audio").mkdir()
+    db.init_db()
+    feed = db.create_feed(slug="empty", upstream_url="https://example.com/e", title="Empty")
+    xml = generate_custom_feed_xml(feed, [], "http://localhost:8080")
+    assert "<title>Empty</title>" in xml
+    assert "<item>" not in xml

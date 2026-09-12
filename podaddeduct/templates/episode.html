@@ -24,7 +24,7 @@
     {% if episode.status == 'ready' or episode.status == 'manual' %}
       <span class="pill ok">Ready — ads removed</span>
     {% elif episode.status == 'working' %}
-      <span class="pill warn">Cleaning… this page refreshes itself</span>
+      <span class="pill warn">Cleaning… this page updates itself</span>
     {% elif episode.status == 'error' %}
       <span class="pill warn">Needs attention</span>
     {% else %}
@@ -43,7 +43,32 @@
   {% endif %}
   {% if key_saved %}<p class="muted ok">Key saved — press Re-check.</p>{% endif %}
 
-  {% if not has_audio and episode.status != 'working' %}
+  {% if episode.status in ('working', 'pending') or (not has_audio and episode.status not in ('ready', 'manual', 'error')) %}
+  <div class="player" id="progressCard">
+    <b id="progressHeading">{% if episode.status == 'working' %}Cleaning this episode{% else %}Waiting to clean{% endif %}</b>
+    <p class="muted" style="margin:0.35rem 0 0" id="progressBlurb">
+      {% if episode.status == 'working' %}
+      Still cleaning — your podcast app picks up the clean file automatically.
+      {% else %}
+      Queued or ready to prepare — status updates live below.
+      {% endif %}
+    </p>
+    <div id="progWrap" class="prog-track" style="margin:0.6rem 0 0.2rem;display:none">
+      <div id="progBar" class="prog-fill" style="width:0%"></div>
+    </div>
+    <p class="muted" id="progText" style="margin:0.3rem 0 0;font-size:0.85rem"></p>
+    <p class="muted" id="liveStatus" style="margin:0.35rem 0 0"></p>
+    {% if episode.status != 'working' %}
+    <form method="post" action="/episodes/{{ episode.id }}/recheck" style="margin-top:0.75rem">
+      <button type="submit">Prepare this episode</button>
+    </form>
+    {% else %}
+    <form method="post" action="/episodes/{{ episode.id }}/recheck" style="margin-top:0.75rem">
+      <button class="ghost" type="submit">Re-check for ads</button>
+    </form>
+    {% endif %}
+  </div>
+  {% elif not has_audio %}
   <div class="player">
     <b>This episode isn't prepared yet.</b>
     <p class="muted">Press Prepare — it downloads once, finds the ads, and saves a clean copy. Old episodes delete themselves later.</p>
@@ -56,15 +81,6 @@
     <b>Listen</b>
     {% if has_clean %}
     <p class="muted ok" style="margin:0.35rem 0 0">Clean copy — the {{ ranges|length }} marked section(s) below were cut out.</p>
-    {% elif episode.status == 'working' %}
-    <p class="muted" style="margin:0.35rem 0 0">Still cleaning — your podcast app picks up the clean file automatically.</p>
-    <div id="progWrap" style="margin:0.6rem 0 0.2rem;display:none">
-      <div style="height:8px;border-radius:4px;background:var(--inset,#222);overflow:hidden">
-        <div id="progBar" style="height:100%;width:0%;border-radius:4px;background:var(--accent,#6db3f2);transition:width .4s"></div>
-      </div>
-      <p class="muted" id="progText" style="margin:0.3rem 0 0;font-size:0.85rem"></p>
-    </div>
-    <p class="muted" id="liveStatus" style="margin:0.35rem 0 0"></p>
     {% elif episode.status == 'error' %}
     <p class="muted" style="margin:0.35rem 0 0">Last attempt failed — see above, then press Prepare to retry.</p>
     {% else %}
@@ -130,45 +146,61 @@ async function loadChapters() {
     const res = await fetch('/chapters/{{ episode.id }}.json');
     render((await res.json()).chapters || []);
   } catch (e) {}
+}
 const initialStatus = '{{ episode.status }}';
 async function pollStatus() {
   try {
     const s = await (await fetch('/api/episodes/{{ episode.id }}/status')).json();
     const live = document.getElementById('liveStatus');
-    if (live && s.job_text) live.textContent = s.job_text;
     const wrap = document.getElementById('progWrap');
     const bar = document.getElementById('progBar');
     const ptext = document.getElementById('progText');
-    if (wrap && s.status === 'working') {
-      let pct = null, label = s.job_text || 'Working…';
+    const heading = document.getElementById('progressHeading');
+    const blurb = document.getElementById('progressBlurb');
+
+    if (s.status === 'working' || s.queue_position != null || s.job_text) {
+      if (heading) heading.textContent = s.status === 'working' ? 'Cleaning this episode' : 'Waiting in line';
+      if (blurb) {
+        blurb.textContent = s.queue_position != null
+          ? `Position #${s.queue_position} in the queue — will start automatically.`
+          : 'Still cleaning — your podcast app picks up the clean file automatically.';
+      }
+      let pct = null, label = s.job_text || (s.queue_position != null ? `#${s.queue_position} in line` : 'Working…');
       if (s.total && s.done != null && s.total > 0) {
         pct = Math.max(0, Math.min(100, Math.round(100 * s.done / s.total)));
-        label = `Detecting ads — chunk ${s.done} of ${s.total}`;
+        if (s.stage === 'downloading') {
+          label = s.job_text || `Downloading… ${pct}%`;
+        } else {
+          label = `Detecting ads — chunk ${s.done} of ${s.total}`;
+        }
         if (s.elapsed_s && s.done > 0) {
           const rate = s.elapsed_s / s.done;
           const left = Math.max(0, Math.round(rate * (s.total - s.done)));
           label += ` · ≈${fmt(left)} left`;
         }
-      } else if (s.elapsed_s) {
+      } else if (s.elapsed_s && s.status === 'working') {
         label = (s.job_text || 'Working…') + ` · ${fmt(Math.round(s.elapsed_s))} elapsed`;
       }
-      if (pct != null && bar) {
+      if (wrap && bar) {
         wrap.style.display = '';
-        bar.style.width = pct + '%';
-      } else if (wrap && bar) {
-        wrap.style.display = '';
-        bar.style.width = '100%';
-        bar.style.opacity = '0.35';
+        if (pct != null) {
+          bar.style.width = pct + '%';
+          bar.classList.remove('indeterminate');
+        } else {
+          bar.style.width = '40%';
+          bar.classList.add('indeterminate');
+        }
       }
       if (ptext) ptext.textContent = label;
       if (live) live.textContent = '';
     }
-    if (s.status !== initialStatus) {
+
+    if (s.status !== initialStatus && (s.status === 'ready' || s.status === 'manual' || s.status === 'error')) {
       location.reload();
       return;
     }
   } catch (e) {}
-  setTimeout(pollStatus, 2500);
+  setTimeout(pollStatus, 2000);
 }
 if (initialStatus === 'working' || initialStatus === 'pending') pollStatus();
 if (player) player.addEventListener('timeupdate', () => {

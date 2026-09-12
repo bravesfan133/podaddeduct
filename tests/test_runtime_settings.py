@@ -169,7 +169,7 @@ def test_mutating_routes_need_login(tmp_path, monkeypatch):
             assert client.get("/export.opml").status_code == 303
             # player routes stay open by design
             feed = db.create_feed(slug="open", upstream_url="https://x.test/rss", title="O")
-            assert client.get("/feeds/open.xml").status_code in (200, 502)
+            assert client.get("/feeds/open.xml").status_code == 200
     finally:
         set_app_password("")
 

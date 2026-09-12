@@ -29,12 +29,12 @@ from .feeds import (
     entry_guid,
     entry_pub_date,
     fetch_feed_bytes,
+    generate_custom_feed_xml,
     parse_feed,
-    rewrite_feed_xml,
     slug_for_upstream,
     transcript_for_entry,
 )
-from .process import enqueue_episode, ensure_worker, friendly_error
+from .process import enqueue_episode, ensure_worker, friendly_error, get_queue_details
 from .secrets import (
     get_app_password,
     gemini_key_status,
@@ -117,15 +117,14 @@ def _feed_artwork(parsed) -> str:
     return ""
 
 
-# Rendered-feed cache: podcast apps poll aggressively and big upstream
-# feeds are megabytes to parse. 60s TTL per (show, base URL) keeps the N100
-# responsive. In-flight cleaning still progresses; slightly stale lengths
-# self-correct on the next poll.
+# Rendered-feed cache: podcast apps poll aggressively. Local SQLite generation
+# is already fast; a short TTL avoids rebuilding identical XML on every hit.
 _feed_cache: dict[tuple[str, str], tuple[float, bytes]] = {}
 _FEED_TTL = 60.0
 
 
 async def render_feed_response(feed: db.Feed, request: Request) -> Response:
+    """Serve a custom RSS feed from local ready episodes — no upstream I/O."""
     import time
 
     base = public_base(request)
@@ -135,39 +134,19 @@ async def render_feed_response(feed: db.Feed, request: Request) -> Response:
         return Response(
             content=hit[1],
             media_type="application/rss+xml; charset=utf-8",
-            headers={"Cache-Control": "no-cache"},
+            headers={"Cache-Control": "public, max-age=60"},
         )
-    # Feed refreshes are cheap metadata syncs. Never bulk-queue here —
-    # podcast apps refresh often and would flood the worker.
-    try:
-        raw = await fetch_feed_bytes(feed.upstream_url)
-    except Exception as exc:
-        if hit:
-            return Response(
-                content=hit[1],
-                media_type="application/rss+xml; charset=utf-8",
-                headers={"Cache-Control": "no-cache"},
-            )
-        raise HTTPException(502, f"Couldn't reach the publisher's feed: {exc}") from exc
-    try:
-        await sync_feed_episodes(feed, queue_recent=False, autodl=True, raw=raw)
-    except Exception:
-        logger.exception("Feed sync failed")
+
+    # Fresh row so title/artwork/description reflect the latest background sync.
     feed = db.get_feed(feed.id) or feed
-    parsed = parse_feed(raw, href=feed.upstream_url)
-    episodes = {e.guid: e for e in db.list_episodes(feed.id)}
-    xml = rewrite_feed_xml(
-        parsed,
-        feed=feed,
-        episodes_by_guid=episodes,
-        public_base=base,
-    )
+    episodes = db.list_ready_episodes(feed.id)
+    xml = generate_custom_feed_xml(feed, episodes, base)
     content = xml.encode("utf-8")
     _feed_cache[cache_key] = (time.monotonic(), content)
     return Response(
         content=content,
         media_type="application/rss+xml; charset=utf-8",
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "public, max-age=60"},
     )
 
 
@@ -186,6 +165,18 @@ async def sync_feed_episodes(
     if art and art != (feed.artwork_url or ""):
         db.update_feed_artwork(feed.id, art)
 
+    channel_desc = " ".join(str(parsed.feed.get("description") or "").split())
+    channel_author = str(
+        parsed.feed.get("author") or parsed.feed.get("publisher") or ""
+    ).strip()
+    if channel_desc != (feed.description or "") or channel_author != (feed.author or ""):
+        db.update_feed_channel(
+            feed.id,
+            description=db.clip_description(channel_desc),
+            author=channel_author[:500],
+        )
+        feed = db.get_feed(feed.id) or feed
+
     from .ptranscript import parse_transcript_tags
     from .chapters import chapters_url_for_entry, parse_chapters_tags
 
@@ -203,6 +194,7 @@ async def sync_feed_episodes(
         if not enclosure:
             continue
         turl, ttype = transcript_for_entry(entry, enclosure, tmap)
+        summary = getattr(entry, "summary", None) or getattr(entry, "description", None) or ""
         items.append(
             {
                 "guid": entry_guid(entry, enclosure),
@@ -212,6 +204,7 @@ async def sync_feed_episodes(
                 "transcript_url": turl,
                 "transcript_type": ttype,
                 "chapters_url": chapters_url_for_entry(entry, enclosure, cmap),
+                "description": str(summary),
             }
         )
     episodes = db.upsert_episodes_batch(feed.id, items)
@@ -390,6 +383,7 @@ async def home(request: Request) -> HTMLResponse:
             "cards": cards,
             "storage": stats,
             "storage_pct": round(100 * stats["bytes"] / max(1, stats["limit_bytes"]), 1),
+            "queue": get_queue_details(),
         },
     )
 
@@ -472,6 +466,14 @@ async def api_health(request: Request) -> JSONResponse:
         "worker": worker_state(),
         "disk": disk,
     })
+
+
+@app.get("/api/queue")
+async def api_queue(request: Request) -> JSONResponse:
+    """Live processing queue + current job for the status card."""
+    if not _authed(request):
+        raise HTTPException(401, "Sign in first.")
+    return JSONResponse(get_queue_details())
 
 
 @app.get("/api/episodes/{episode_id}/status")
@@ -720,6 +722,7 @@ def _show_page(feed: db.Feed, request: Request) -> HTMLResponse:
             "rows": rows,
             "public_base": public_base(request),
             "player_url": f"{public_base(request)}/feeds/{feed.slug}.xml",
+            "queue": get_queue_details(),
         },
     )
 

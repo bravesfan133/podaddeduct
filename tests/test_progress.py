@@ -289,3 +289,166 @@ def test_episode_page_has_progress_elements(tmp_path, monkeypatch):
         assert 'id="progBar"' in html
         assert 'id="liveStatus"' in html
         assert "location.reload()" in html  # still reloads on terminal state
+
+
+def test_episode_page_shows_progress_when_pending(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct.app import app
+
+    ep = _make_episode()
+    with TestClient(app) as client:
+        db.update_episode(ep.id, status="pending")
+        html = client.get(f"/episodes/{ep.id}").text
+        assert 'id="progWrap"' in html
+        assert 'id="liveStatus"' in html
+        assert "Waiting to clean" in html or "Prepare" in html
+
+
+def test_download_progress_sets_done_total(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+
+    old = proc_mod._current
+    try:
+        proc_mod._job_start(42)
+        proc_mod._job_stage("downloading")
+        # Simulate the download progress callback.
+        if proc_mod._current is not None:
+            proc_mod._current["done"] = 50 * 1024**2
+            proc_mod._current["total"] = 100 * 1024**2
+            proc_mod._current["detail"] = "50/100 MB"
+        details = proc_mod.get_queue_details()
+        assert details["active"] is True
+        assert details["current"]["stage"] == "downloading"
+        assert details["current"]["percent"] == 50
+        assert details["current"]["job_text"].startswith("Downloading")
+    finally:
+        proc_mod._current = old
+
+
+def test_get_queue_details_idle_and_queued(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+
+    old_current, old_queue, old_recent = proc_mod._current, proc_mod._queue, list(proc_mod._recent_completed)
+    proc_mod._current = None
+    proc_mod._queue = None
+    proc_mod._recent_completed.clear()
+    try:
+        idle = proc_mod.get_queue_details()
+        assert idle["active"] is False
+        assert idle["current"] is None
+        assert idle["queued"] == []
+        assert idle["recent"] == []
+        assert idle["queue_depth"] == 0
+
+        feed = db.create_feed(slug="q1", upstream_url="https://example.com/rss", title="Show One")
+        ep1 = db.upsert_episode(feed.id, guid="g1", title="Ep A",
+                                enclosure_url="https://example.com/a.mp3", pub_date=None)
+        ep2 = db.upsert_episode(feed.id, guid="g2", title="Ep B",
+                                enclosure_url="https://example.com/b.mp3", pub_date=None)
+
+        proc_mod._job_start(ep1.id)
+        proc_mod._job_stage("transcribing")
+        q = proc_mod.get_queue()
+        q.put_nowait((1, 1, ep2.id))
+
+        details = proc_mod.get_queue_details()
+        assert details["active"] is True
+        assert details["current"]["episode_id"] == ep1.id
+        assert details["current"]["title"] == "Ep A"
+        assert details["current"]["feed_title"] == "Show One"
+        assert details["current"]["feed_slug"] == "q1"
+        assert details["current"]["stage"] == "transcribing"
+        assert details["current"]["stage_label"] == "Transcribing"
+        assert details["current"]["percent"] is None  # indeterminate
+        assert details["queue_depth"] == 1
+        assert details["queued"][0]["episode_id"] == ep2.id
+        assert details["queued"][0]["position"] == 1
+        assert details["queued"][0]["title"] == "Ep B"
+    finally:
+        while proc_mod._queue is not None and not proc_mod._queue.empty():
+            try:
+                proc_mod._queue.get_nowait()
+            except Exception:
+                break
+        proc_mod._current = old_current
+        proc_mod._queue = old_queue
+        proc_mod._recent_completed.clear()
+        for item in reversed(old_recent):
+            proc_mod._recent_completed.append(item)
+
+
+def test_record_completed_and_api_queue(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+    from podaddeduct.app import app
+
+    old_current = proc_mod._current
+    old_recent = list(proc_mod._recent_completed)
+    proc_mod._current = None
+    proc_mod._recent_completed.clear()
+    try:
+        feed = db.create_feed(slug="done", upstream_url="https://example.com/rss", title="Done Show")
+        ep = db.upsert_episode(feed.id, guid="g1", title="Finished Ep",
+                               enclosure_url="https://example.com/e.mp3", pub_date=None)
+        db.update_episode(
+            ep.id,
+            status="ready",
+            ad_ranges_json='[{"start":10,"end":40},{"start":100,"end":130}]',
+        )
+        proc_mod._record_completed(ep.id)
+        details = proc_mod.get_queue_details()
+        assert len(details["recent"]) == 1
+        assert details["recent"][0]["title"] == "Finished Ep"
+        assert details["recent"][0]["ads"] == 2
+        assert details["recent"][0]["saved_seconds"] == 60.0
+
+        with TestClient(app) as client:
+            r = client.get("/api/queue")
+            assert r.status_code == 200
+            body = r.json()
+            for key in ("active", "queue_depth", "current", "queued", "recent"):
+                assert key in body, key
+            assert body["recent"][0]["episode_id"] == ep.id
+
+            home = client.get("/")
+            assert home.status_code == 200
+            assert 'id="queueCard"' in home.text
+            assert 'id="queueBody"' in home.text
+            assert "/api/queue" in home.text
+
+            show = client.get(f"/shows/{feed.slug}")
+            assert show.status_code == 200
+            assert 'id="queueCard"' in show.text
+            assert "/api/queue" in show.text
+    finally:
+        proc_mod._current = old_current
+        proc_mod._recent_completed.clear()
+        for item in reversed(old_recent):
+            proc_mod._recent_completed.append(item)
+
+
+def test_home_renders_with_active_queue(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import process as proc_mod
+    from podaddeduct.app import app
+
+    feed = db.create_feed(slug="live", upstream_url="https://example.com/rss", title="Live")
+    ep = db.upsert_episode(feed.id, guid="g1", title="Live Ep",
+                           enclosure_url="https://example.com/e.mp3", pub_date=None)
+    old = proc_mod._current
+    try:
+        proc_mod._job_start(ep.id)
+        proc_mod._job_stage("detecting")
+        proc_mod._job_progress(2, 5)
+        with TestClient(app) as client:
+            html = client.get("/").text
+            assert "Processing" in html
+            assert "Live Ep" in html or "queueBody" in html
+            body = client.get("/api/queue").json()
+            assert body["active"] is True
+            assert body["current"]["percent"] == 40
+            assert body["current"]["eta_s"] is not None or body["current"]["done"] == 2
+    finally:
+        proc_mod._current = old

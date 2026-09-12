@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 from . import db
@@ -24,6 +25,19 @@ logger = logging.getLogger("podaddeduct.process")
 #  "done": int | None, "total": int | None}
 _current: dict | None = None
 
+# Rolling ring of recently cleaned episodes for the status card.
+_recent_completed: deque[dict] = deque(maxlen=5)
+
+_STAGE_LABELS = {
+    "queued": "Waiting",
+    "downloading": "Downloading",
+    "decoding": "Reading audio",
+    "transcribing": "Transcribing",
+    "detecting": "Finding ads",
+    "cutting": "Cutting",
+    "finishing": "Finishing",
+}
+
 
 def _job_start(episode_id: int) -> None:
     global _current
@@ -36,7 +50,8 @@ def _job_stage(stage: str, detail: str = "") -> None:
         _current["stage"] = stage
         _current["detail"] = detail
         _current["started_at"] = time.monotonic()
-        if stage != "detecting":
+        # Keep progress counters only for stages that report fine-grained progress.
+        if stage not in ("detecting", "downloading"):
             _current["done"] = None
             _current["total"] = None
 
@@ -59,6 +74,27 @@ def _job_done(episode_id: int) -> None:
     global _current
     if _current and _current.get("episode_id") == episode_id:
         _current = None
+
+
+def _record_completed(episode_id: int) -> None:
+    """Push a cleaned episode onto the recent-completions ring."""
+    ep = db.get_episode(episode_id)
+    if not ep or ep.status not in {"ready", "manual"}:
+        return
+    feed = db.get_feed(ep.feed_id)
+    ranges = db.get_ad_ranges(ep)
+    saved = round(sum(max(0.0, r["end"] - r["start"]) for r in ranges), 1) if ranges else 0.0
+    _recent_completed.appendleft(
+        {
+            "episode_id": ep.id,
+            "title": ep.title or f"Episode {ep.id}",
+            "feed_title": (feed.title or feed.slug) if feed else "",
+            "feed_slug": feed.slug if feed else "",
+            "ads": len(ranges),
+            "saved_seconds": saved,
+            "completed_at": time.time(),
+        }
+    )
 
 
 def describe_job(job: dict | None = None) -> str:
@@ -85,6 +121,13 @@ def describe_job(job: dict | None = None) -> str:
     return "Working…"
 
 
+def stage_label(stage: str | None) -> str:
+    """Short badge text for the status card."""
+    if not stage:
+        return ""
+    return _STAGE_LABELS.get(stage, "Working")
+
+
 def queue_position(episode_id: int) -> int | None:
     """1-based position among waiting jobs, or None if not queued."""
     q = _queue
@@ -100,19 +143,96 @@ def queue_position(episode_id: int) -> int | None:
     return None
 
 
+def _waiting_ids() -> list[int]:
+    q = _queue
+    if q is None:
+        return []
+    try:
+        return [eid for _, _, eid in sorted(q._queue)]
+    except Exception:
+        return []
+
+
+def _episode_meta(episode_id: int) -> dict:
+    ep = db.get_episode(episode_id)
+    if not ep:
+        return {
+            "episode_id": episode_id,
+            "title": f"Episode {episode_id}",
+            "feed_title": "",
+            "feed_slug": "",
+            "feed_id": None,
+        }
+    feed = db.get_feed(ep.feed_id)
+    return {
+        "episode_id": ep.id,
+        "title": ep.title or f"Episode {ep.id}",
+        "feed_title": (feed.title or feed.slug) if feed else "",
+        "feed_slug": feed.slug if feed else "",
+        "feed_id": ep.feed_id,
+        "status": ep.status,
+    }
+
+
+def _progress_fields(job: dict) -> tuple[int | None, float | None]:
+    """Return (percent 0-100, eta_s) from done/total + elapsed."""
+    done = job.get("done")
+    total = job.get("total")
+    elapsed = float(job.get("elapsed") or 0)
+    percent: int | None = None
+    eta_s: float | None = None
+    if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
+        percent = max(0, min(100, int(round(100.0 * float(done) / float(total)))))
+        if done > 0 and done < total and elapsed > 0:
+            eta_s = round(elapsed * (float(total) - float(done)) / float(done), 1)
+    return percent, eta_s
+
+
 def worker_state() -> dict:
     """Snapshot for /api/health: current job (with elapsed) + waiting ids."""
-    q = _queue
-    waiting: list[int] = []
-    if q is not None:
-        try:
-            waiting = [eid for _, _, eid in sorted(q._queue)]
-        except Exception:
-            waiting = []
+    waiting = _waiting_ids()
     current = None
     if _current:
         current = {**_current, "elapsed": round(_job_elapsed(), 1)}
     return {"current": current, "queued": waiting, "alive": _worker_started}
+
+
+def get_queue_details() -> dict:
+    """Rich queue snapshot for the live status card (/api/queue)."""
+    waiting = _waiting_ids()
+    current_out = None
+    if _current:
+        eid = int(_current["episode_id"])
+        meta = _episode_meta(eid)
+        elapsed = round(_job_elapsed(), 1)
+        job = {**_current, "elapsed": elapsed}
+        percent, eta_s = _progress_fields(job)
+        stage = job.get("stage") or ""
+        current_out = {
+            **meta,
+            "stage": stage,
+            "stage_label": stage_label(stage),
+            "job_text": describe_job(job),
+            "detail": job.get("detail") or "",
+            "done": job.get("done"),
+            "total": job.get("total"),
+            "percent": percent,
+            "elapsed_s": elapsed,
+            "eta_s": eta_s,
+        }
+    queued_out = []
+    for i, eid in enumerate(waiting):
+        meta = _episode_meta(eid)
+        queued_out.append({**meta, "position": i + 1})
+    active = current_out is not None or bool(queued_out)
+    return {
+        "active": active,
+        "queue_depth": len(queued_out),
+        "current": current_out,
+        "queued": queued_out,
+        "recent": list(_recent_completed),
+        "alive": _worker_started,
+    }
 
 _queue: asyncio.PriorityQueue[tuple[int, int, int]] | None = None
 _worker_started = False
@@ -253,6 +373,8 @@ async def process_episode(episode_id: int) -> None:
 
         def _progress(done: int, total: int) -> None:
             if _current is not None:
+                _current["done"] = done
+                _current["total"] = total if total else None
                 if total:
                     _current["detail"] = f"{done // 1024**2}/{total // 1024**2} MB"
                 else:
@@ -406,6 +528,8 @@ def _finalize(
             pass
 
     db.update_episode(episode_id, **fields)
+    if fields.get("status") in {"ready", "manual"}:
+        _record_completed(episode_id)
 
     # Opportunistic janitor so disk never grows unbounded.
     try:

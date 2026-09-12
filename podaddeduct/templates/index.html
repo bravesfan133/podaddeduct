@@ -37,6 +37,12 @@
   </div>
   <h1>Your podcasts, without the ads</h1>
   <p class="sub">Add a show, copy its link into Apple Podcasts once, and new episodes show up cleaned. Old episodes are deleted automatically so your disk stays small.</p>
+
+  <div class="card queue-card" id="queueCard" data-queue-root>
+    <h2>Processing</h2>
+    <div id="queueBody"></div>
+  </div>
+
   <div class="card">
     <h2>1 &nbsp;Add a show</h2>
     <label for="q">Search by name</label>
@@ -68,15 +74,15 @@
       <div><b>②</b> Play. First play of a new episode takes a few minutes to clean; afterwards it's instant.</div>
     </div>
     {% if cards %}
-    <ul>
+    <ul id="showList">
       {% for c in cards %}
-      <li class="show">
+      <li class="show" data-feed-slug="{{ c.feed.slug }}" data-feed-id="{{ c.feed.id }}">
         {% if c.feed.artwork_url %}<img src="{{ c.feed.artwork_url }}" alt="" />{% endif %}
         <div style="flex:1">
           <a href="/shows/{{ c.feed.slug }}"><b>{{ c.feed.title or c.feed.slug }}</b></a>
-          <div class="meta">
-            {% if c.working %}<span class="pill">Cleaning {{ c.working }}…</span>
-            {% elif c.ready %}<span class="pill">{{ c.ready }} ready</span>
+          <div class="meta" data-show-meta>
+            {% if c.working %}<span class="pill warn">Cleaning {{ c.working }}…</span>
+            {% elif c.ready %}<span class="pill ok">{{ c.ready }} ready</span>
             {% else %}<span class="pill">New — opens on first play</span>{% endif %}
           </div>
           <code class="url" id="u-{{ c.feed.slug }}">{{ public_base }}/feeds/{{ c.feed.slug }}.xml</code>
@@ -97,6 +103,106 @@
   </div>
 </main>
 <script>
+const INITIAL_QUEUE = {{ queue | tojson }};
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return s + 's';
+  return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0');
+}
+function fmtSaved(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function renderQueueCard(data) {
+  const body = document.getElementById('queueBody');
+  if (!body) return;
+  const cur = data.current;
+  const queued = data.queued || [];
+  const recent = data.recent || [];
+  let html = '';
+  if (cur) {
+    const pct = cur.percent;
+    const indeterminate = pct == null;
+    let meta = esc(cur.job_text || cur.stage_label || 'Working…');
+    if (cur.elapsed_s) meta += ' · ' + fmtTime(cur.elapsed_s) + ' elapsed';
+    if (cur.eta_s != null) meta += ' · ≈' + fmtTime(cur.eta_s) + ' left';
+    html += `<div class="queue-job">
+      <div class="queue-job-head">
+        <span class="pill warn">${esc(cur.stage_label || 'Working')}</span>
+        <a class="queue-job-title" href="/episodes/${cur.episode_id}">${esc(cur.title)}</a>
+        ${cur.feed_slug ? `<a class="queue-job-show" href="/shows/${esc(cur.feed_slug)}">${esc(cur.feed_title)}</a>` : ''}
+      </div>
+      <div class="prog-track"><div class="prog-fill${indeterminate ? ' indeterminate' : ''}" style="width:${indeterminate ? 40 : pct}%"></div></div>
+      <p class="queue-job-meta">${meta}</p>
+    </div>`;
+  } else if (!queued.length && !recent.length) {
+    html += '<p class="queue-idle">Nothing cleaning right now — new episodes appear here when they start.</p>';
+  } else if (!queued.length) {
+    html += '<p class="queue-idle">Queue empty — worker is idle.</p>';
+  }
+  if (queued.length) {
+    html += `<div class="queue-section-label">Up next (${queued.length})</div><ul class="queue-list">`;
+    for (const q of queued) {
+      html += `<li>
+        <span class="queue-pos">#${q.position}</span>
+        <a href="/episodes/${q.episode_id}">${esc(q.title)}</a>
+        <span class="muted">${esc(q.feed_title)}</span>
+      </li>`;
+    }
+    html += '</ul>';
+  }
+  if (recent.length) {
+    html += `<div class="queue-section-label">Recently cleaned</div><ul class="queue-recent">`;
+    for (const r of recent) {
+      const ads = r.ads ? `${r.ads} ad${r.ads === 1 ? '' : 's'} cut (${fmtSaved(r.saved_seconds)} saved)` : 'no ads found';
+      html += `<li><span class="ok">✓</span> <a href="/episodes/${r.episode_id}">${esc(r.title)}</a>
+        <span class="muted"> · ${ads}</span></li>`;
+    }
+    html += '</ul>';
+  }
+  body.innerHTML = html;
+
+  // Update per-show cleaning badges from live queue.
+  const byFeed = {};
+  if (cur && cur.feed_slug) byFeed[cur.feed_slug] = (byFeed[cur.feed_slug] || 0) + 1;
+  for (const q of queued) {
+    if (q.feed_slug) byFeed[q.feed_slug] = (byFeed[q.feed_slug] || 0) + 1;
+  }
+  document.querySelectorAll('[data-feed-slug]').forEach(li => {
+    const slug = li.getAttribute('data-feed-slug');
+    const meta = li.querySelector('[data-show-meta]');
+    if (!meta) return;
+    const n = byFeed[slug] || 0;
+    if (n > 0) {
+      meta.innerHTML = `<span class="pill warn">Cleaning ${n}…</span>`;
+    }
+  });
+}
+
+let _queueTimer = null;
+async function pollQueue() {
+  try {
+    const r = await fetch('/api/queue');
+    if (r.ok) {
+      const data = await r.json();
+      renderQueueCard(data);
+      clearTimeout(_queueTimer);
+      _queueTimer = setTimeout(pollQueue, data.active ? 2500 : 10000);
+      return;
+    }
+  } catch (e) {}
+  clearTimeout(_queueTimer);
+  _queueTimer = setTimeout(pollQueue, 10000);
+}
+renderQueueCard(INITIAL_QUEUE || { active: false, current: null, queued: [], recent: [] });
+pollQueue();
+
 const q = document.getElementById('q'), box = document.getElementById('results');
 async function search() {
   const term = q.value.trim();

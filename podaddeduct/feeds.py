@@ -103,9 +103,11 @@ def rewrite_feed_xml(
     item_limit: int | None = None,
 ) -> str:
     channel_title = _xml_text(feed.title or parsed.feed.get("title") or feed.slug)
-    channel_desc = _xml_text(parsed.feed.get("description") or "")
+    channel_desc = _xml_text(parsed.feed.get("description") or feed.description or "")
     channel_link = escape(parsed.feed.get("link") or public_base)
-    author = _xml_text(parsed.feed.get("author") or parsed.feed.get("publisher") or channel_title)
+    author = _xml_text(
+        parsed.feed.get("author") or parsed.feed.get("publisher") or feed.author or channel_title
+    )
     language = escape(parsed.feed.get("language") or "en-us")
     image = ""
     image_href = ""
@@ -113,6 +115,8 @@ def rewrite_feed_xml(
         image_href = parsed.feed.image.href
     elif parsed.feed.get("itunes_image", {}).get("href"):
         image_href = parsed.feed.itunes_image.href
+    if not image_href and feed.artwork_url:
+        image_href = feed.artwork_url
     if image_href:
         href = escape(image_href)
         image = f"<itunes:image href=\"{href}\"/>\n    <image><url>{href}</url></image>"
@@ -135,7 +139,12 @@ def rewrite_feed_xml(
         if ep is None:
             continue
         title = _xml_text(getattr(entry, "title", None) or ep.title or "Episode")
-        desc = _xml_text(getattr(entry, "summary", None) or getattr(entry, "description", None) or "")
+        desc = _xml_text(
+            getattr(entry, "summary", None)
+            or getattr(entry, "description", None)
+            or ep.description
+            or ""
+        )
         pub = entry_pub_date(entry) or ""
         pub_out = pub
         try:
@@ -193,6 +202,84 @@ def rewrite_feed_xml(
     <title>{channel_title}</title>
     <link>{channel_link}</link>
     <language>{language}</language>
+    <description>{channel_desc}</description>
+    <itunes:author>{author}</itunes:author>
+    <itunes:summary>{channel_desc}</itunes:summary>
+    <itunes:explicit>false</itunes:explicit>
+    {image}
+    {''.join(items)}
+  </channel>
+</rss>
+"""
+
+
+def generate_custom_feed_xml(
+    feed: db.Feed,
+    episodes: list[db.Episode],
+    public_base: str,
+) -> str:
+    """Build a lightweight RSS 2.0 feed from local ready episodes only.
+
+    No upstream XML is required — podcast apps get an instant, small custom
+    feed whose enclosures always point at /audio/{id}.
+    """
+    channel_title = _xml_text(feed.title or feed.slug)
+    channel_desc = _xml_text(feed.description or "")
+    channel_link = escape(public_base.rstrip("/"))
+    author = _xml_text(feed.author or channel_title)
+    image = ""
+    if feed.artwork_url:
+        href = escape(feed.artwork_url)
+        image = f'<itunes:image href="{href}"/>\n    <image><url>{href}</url></image>'
+
+    items: list[str] = []
+    for ep in episodes:
+        title = _xml_text(ep.title or "Episode")
+        desc = _xml_text(ep.description or "")
+        pub_out = ep.pub_date or ""
+        if pub_out:
+            try:
+                pub_out = format_datetime(parsedate_to_datetime(pub_out))
+            except Exception:
+                pass
+
+        enc_url = f"{public_base.rstrip('/')}/audio/{ep.id}"
+        length = str(ep.size_bytes or 0)
+        served = db.served_audio_path(ep)
+        if served:
+            try:
+                length = str(served.stat().st_size)
+            except OSError:
+                pass
+
+        duration_tag = ""
+        if ep.duration_seconds:
+            duration_tag = f"<itunes:duration>{int(ep.duration_seconds)}</itunes:duration>"
+
+        items.append(
+            f"""
+    <item>
+      <title>{title}</title>
+      <description>{desc}</description>
+      <itunes:title>{title}</itunes:title>
+      <itunes:summary>{desc}</itunes:summary>
+      <itunes:author>{author}</itunes:author>
+      <itunes:explicit>false</itunes:explicit>
+      {duration_tag}
+      <guid isPermaLink="false">{escape(ep.guid)}</guid>
+      <pubDate>{escape(pub_out)}</pubDate>
+      <enclosure url="{escape(enc_url)}" length="{escape(length)}" type="audio/mpeg" />
+    </item>"""
+        )
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>{channel_title}</title>
+    <link>{channel_link}</link>
+    <language>en-us</language>
     <description>{channel_desc}</description>
     <itunes:author>{author}</itunes:author>
     <itunes:summary>{channel_desc}</itunes:summary>

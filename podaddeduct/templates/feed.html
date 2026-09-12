@@ -28,6 +28,11 @@
     <p class="muted" style="margin:0.25rem 0 0">{{ episodes|length }} episodes tracked · oldest delete themselves</p></div>
   </div>
 
+  <div class="card queue-card" id="queueCard" {% if not queue.active %}style="display:none"{% endif %}>
+    <h2>Cleaning this show</h2>
+    <div id="queueBody"></div>
+  </div>
+
   <div class="card">
     <b>Paste this once in Apple Podcasts</b>
     <div class="linkbox"><code id="feedlink">{{ player_url }}</code></div>
@@ -62,16 +67,16 @@
     <thead><tr><th>Episode</th><th>Status</th><th>Saved</th><th></th></tr></thead>
     <tbody>
     {% for r in rows %}
-      <tr>
+      <tr data-ep-id="{{ r.ep.id }}" data-ep-status="{{ r.ep.status }}">
         <td><a href="/episodes/{{ r.ep.id }}">{{ r.ep.title }}</a><br /><span class="muted">{{ r.ep.pub_date or '' }}</span></td>
-        <td>
+        <td data-status-cell>
           {% if r.ep.status == 'ready' or r.ep.status == 'manual' %}<span class="pill ok">Ready</span>
           {% elif r.ep.status == 'working' %}<span class="pill warn">Cleaning…</span>
           {% elif r.ep.status == 'error' %}<span class="pill warn">Needs attention</span>
           {% else %}<span class="pill">New</span>{% endif %}
         </td>
-        <td class="muted">{% if r.ads %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
-        <td>{% if r.ep.status in ('pending', 'error') %}<form method="post" action="/episodes/{{ r.ep.id }}/recheck" style="display:inline"><button type="submit" class="ghost" style="margin:0;padding:0.35rem 0.7rem;font-size:0.85rem">Prepare</button></form>{% endif %}</td>
+        <td class="muted" data-saved-cell>{% if r.ads %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
+        <td data-action-cell>{% if r.ep.status in ('pending', 'error') %}<form method="post" action="/episodes/{{ r.ep.id }}/recheck" style="display:inline"><button type="submit" class="ghost" style="margin:0;padding:0.35rem 0.7rem;font-size:0.85rem">Prepare</button></form>{% endif %}</td>
       </tr>
     {% else %}
       <tr><td colspan="4" class="muted">No episodes yet — press “Check for new episodes”.</td></tr>
@@ -79,8 +84,146 @@
     </tbody>
   </table>
 <script>
+const FEED_SLUG = {{ feed.slug | tojson }};
+const FEED_ID = {{ feed.id | tojson }};
+const INITIAL_QUEUE = {{ queue | tojson }};
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return s + 's';
+  return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0');
+}
+function fmtSaved(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function forThisShow(item) {
+  return item && (item.feed_slug === FEED_SLUG || item.feed_id === FEED_ID);
+}
+
+function renderQueueCard(data) {
+  const card = document.getElementById('queueCard');
+  const body = document.getElementById('queueBody');
+  if (!card || !body) return;
+  const cur = forThisShow(data.current) ? data.current : null;
+  const queued = (data.queued || []).filter(forThisShow);
+  const recent = (data.recent || []).filter(forThisShow).slice(0, 3);
+  const showCard = !!(cur || queued.length);
+  card.style.display = showCard ? '' : 'none';
+  if (!showCard) {
+    updateTableRows(data);
+    return;
+  }
+  let html = '';
+  if (cur) {
+    const pct = cur.percent;
+    const indeterminate = pct == null;
+    let meta = esc(cur.job_text || cur.stage_label || 'Working…');
+    if (cur.elapsed_s) meta += ' · ' + fmtTime(cur.elapsed_s) + ' elapsed';
+    if (cur.eta_s != null) meta += ' · ≈' + fmtTime(cur.eta_s) + ' left';
+    html += `<div class="queue-job">
+      <div class="queue-job-head">
+        <span class="pill warn">${esc(cur.stage_label || 'Working')}</span>
+        <a class="queue-job-title" href="/episodes/${cur.episode_id}">${esc(cur.title)}</a>
+      </div>
+      <div class="prog-track"><div class="prog-fill${indeterminate ? ' indeterminate' : ''}" style="width:${indeterminate ? 40 : pct}%"></div></div>
+      <p class="queue-job-meta">${meta}</p>
+    </div>`;
+  }
+  if (queued.length) {
+    html += `<div class="queue-section-label">Up next</div><ul class="queue-list">`;
+    for (const q of queued) {
+      html += `<li><span class="queue-pos">#${q.position}</span>
+        <a href="/episodes/${q.episode_id}">${esc(q.title)}</a></li>`;
+    }
+    html += '</ul>';
+  }
+  if (recent.length) {
+    html += `<div class="queue-section-label">Recently cleaned</div><ul class="queue-recent">`;
+    for (const r of recent) {
+      const ads = r.ads ? `${r.ads} ads · ${fmtSaved(r.saved_seconds)} saved` : 'no ads found';
+      html += `<li><span class="ok">✓</span> <a href="/episodes/${r.episode_id}">${esc(r.title)}</a>
+        <span class="muted"> · ${ads}</span></li>`;
+    }
+    html += '</ul>';
+  }
+  body.innerHTML = html;
+  updateTableRows(data);
+}
+
+function updateTableRows(data) {
+  const cur = data.current;
+  const queuedMap = {};
+  for (const q of (data.queued || [])) queuedMap[q.episode_id] = q.position;
+  const recentMap = {};
+  for (const r of (data.recent || [])) recentMap[r.episode_id] = r;
+
+  document.querySelectorAll('tr[data-ep-id]').forEach(tr => {
+    const id = Number(tr.getAttribute('data-ep-id'));
+    const statusCell = tr.querySelector('[data-status-cell]');
+    const savedCell = tr.querySelector('[data-saved-cell]');
+    const actionCell = tr.querySelector('[data-action-cell]');
+    if (!statusCell) return;
+
+    if (cur && cur.episode_id === id) {
+      const pct = cur.percent;
+      const label = esc(cur.job_text || cur.stage_label || 'Cleaning…');
+      let bar = '';
+      if (pct != null) {
+        bar = `<div class="mini-prog"><div style="width:${pct}%"></div></div>`;
+      } else {
+        bar = `<div class="mini-prog"><div class="prog-fill indeterminate" style="width:40%;height:100%"></div></div>`;
+      }
+      statusCell.innerHTML = `<span class="pill warn">${label}</span>${bar}`;
+      tr.setAttribute('data-ep-status', 'working');
+      if (actionCell) actionCell.innerHTML = '';
+      return;
+    }
+    if (queuedMap[id] != null) {
+      statusCell.innerHTML = `<span class="pill warn">#${queuedMap[id]} in queue</span>`;
+      tr.setAttribute('data-ep-status', 'pending');
+      if (actionCell) actionCell.innerHTML = '';
+      return;
+    }
+    if (recentMap[id]) {
+      const r = recentMap[id];
+      statusCell.innerHTML = '<span class="pill ok">Ready</span>';
+      if (savedCell) {
+        savedCell.textContent = r.ads
+          ? `${r.ads} ads · ${fmtSaved(r.saved_seconds)}`
+          : '—';
+      }
+      tr.setAttribute('data-ep-status', 'ready');
+      if (actionCell) actionCell.innerHTML = '';
+    }
+  });
+}
+
+let _queueTimer = null;
+async function pollQueue() {
+  try {
+    const r = await fetch('/api/queue');
+    if (r.ok) {
+      const data = await r.json();
+      renderQueueCard(data);
+      const relevant = forThisShow(data.current) || (data.queued || []).some(forThisShow);
+      clearTimeout(_queueTimer);
+      _queueTimer = setTimeout(pollQueue, relevant || data.active ? 2500 : 10000);
+      return;
+    }
+  } catch (e) {}
+  clearTimeout(_queueTimer);
+  _queueTimer = setTimeout(pollQueue, 10000);
+}
+renderQueueCard(INITIAL_QUEUE || { active: false, current: null, queued: [], recent: [] });
+pollQueue();
+
 async function copyText(t) {
-  // clipboard API needs a secure context (https/localhost); LAN http falls back.
   try {
     await navigator.clipboard.writeText(t);
     return true;

@@ -27,6 +27,8 @@ class Feed:
     created_at: str
     artwork_url: str = ""
     settings_json: str = "{}"
+    description: str = ""
+    author: str = ""
 
 
 @dataclass
@@ -51,6 +53,7 @@ class Episode:
     updated_at: str = ""
     size_bytes: int = 0
     last_served_at: str | None = None
+    description: str = ""
 
 
 def pub_ts_for(pub_date: str | None) -> float:
@@ -116,6 +119,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE feeds ADD COLUMN artwork_url TEXT NOT NULL DEFAULT ''")
     if "settings_json" not in feed_cols:
         conn.execute("ALTER TABLE feeds ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'")
+    if "description" not in feed_cols:
+        conn.execute("ALTER TABLE feeds ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+    if "author" not in feed_cols:
+        conn.execute("ALTER TABLE feeds ADD COLUMN author TEXT NOT NULL DEFAULT ''")
     ep_cols = {row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()}
     if "clean_audio_path" not in ep_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN clean_audio_path TEXT")
@@ -131,6 +138,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE episodes ADD COLUMN transcript_type TEXT")
     if "chapters_url" not in ep_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN chapters_url TEXT")
+    if "description" not in ep_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN description TEXT NOT NULL DEFAULT ''")
     # Backfill sortable timestamps for rows written before pub_ts existed.
     try:
         stale = conn.execute(
@@ -177,6 +186,8 @@ def _feed_from_row(row: sqlite3.Row) -> Feed:
         created_at=row["created_at"],
         artwork_url=row["artwork_url"] if "artwork_url" in keys else "",
         settings_json=row["settings_json"] if "settings_json" in keys else "{}",
+        description=row["description"] if "description" in keys else "",
+        author=row["author"] if "author" in keys else "",
     )
 
 
@@ -203,6 +214,7 @@ def _episode_from_row(row: sqlite3.Row) -> Episode:
         updated_at=row["updated_at"],
         size_bytes=int(row["size_bytes"] or 0) if "size_bytes" in keys else 0,
         last_served_at=row["last_served_at"] if "last_served_at" in keys else None,
+        description=row["description"] if "description" in keys else "",
     )
 
 
@@ -248,6 +260,23 @@ def update_feed_title(feed_id: int, title: str) -> None:
         conn.execute("UPDATE feeds SET title = ? WHERE id = ?", (title, feed_id))
 
 
+def update_feed_channel(feed_id: int, *, description: str | None = None, author: str | None = None) -> None:
+    """Persist channel-level metadata used by the custom player feed."""
+    updates: list[str] = []
+    values: list[Any] = []
+    if description is not None:
+        updates.append("description = ?")
+        values.append(description)
+    if author is not None:
+        updates.append("author = ?")
+        values.append(author)
+    if not updates:
+        return
+    values.append(feed_id)
+    with connect() as conn:
+        conn.execute(f"UPDATE feeds SET {', '.join(updates)} WHERE id = ?", values)
+
+
 def get_episode(episode_id: int) -> Episode | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
@@ -270,6 +299,21 @@ def list_episodes(feed_id: int) -> list[Episode]:
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM episodes WHERE feed_id = ? ORDER BY pub_ts DESC, id ASC",
+            (feed_id,),
+        ).fetchall()
+    return [_episode_from_row(r) for r in rows]
+
+
+def list_ready_episodes(feed_id: int) -> list[Episode]:
+    """Episodes published in the custom player feed — processed/clean only."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM episodes
+            WHERE feed_id = ?
+              AND (status IN ('ready', 'manual') OR clean_audio_path IS NOT NULL)
+            ORDER BY pub_ts DESC, id ASC
+            """,
             (feed_id,),
         ).fetchall()
     return [_episode_from_row(r) for r in rows]
@@ -338,6 +382,14 @@ def upsert_episode(
     return ep
 
 
+def clip_description(value: str | None, limit: int = 2000) -> str:
+    """Collapse whitespace and truncate long show notes for SQLite storage."""
+    if not value:
+        return ""
+    cleaned = " ".join(str(value).split())
+    return cleaned[:limit] if len(cleaned) > limit else cleaned
+
+
 def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
     """Upsert many episodes in a single transaction, preserving input order.
 
@@ -346,7 +398,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
     with a single commit: well under a second. Same per-row semantics as
     upsert_episode (enclosure change resets processing state).
     Items: dicts with guid/title/enclosure_url/pub_date keys
-    (plus optional transcript_url/transcript_type/chapters_url).
+    (plus optional transcript_url/transcript_type/chapters_url/description).
     """
     now = _utc_now()
     rows = [
@@ -359,6 +411,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             it.get("transcript_url"),
             it.get("transcript_type"),
             it.get("chapters_url"),
+            clip_description(it.get("description")),
         )
         for it in items
         if it.get("guid") and it.get("enclosure_url")
@@ -370,9 +423,9 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             """
             INSERT INTO episodes (
                 feed_id, guid, title, enclosure_url, pub_date, pub_ts,
-                transcript_url, transcript_type, chapters_url,
+                transcript_url, transcript_type, chapters_url, description,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             ON CONFLICT(feed_id, guid) DO UPDATE SET
                 title = excluded.title,
                 enclosure_url = excluded.enclosure_url,
@@ -381,6 +434,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
                 transcript_url = excluded.transcript_url,
                 transcript_type = excluded.transcript_type,
                 chapters_url = excluded.chapters_url,
+                description = excluded.description,
                 updated_at = excluded.updated_at,
                 audio_path = CASE
                     WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
@@ -399,8 +453,8 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
                     ELSE episodes.error END
             """,
             [
-                (feed_id, guid, title, enc, pub, ts, turl, ttype, curl, now)
-                for (guid, title, enc, pub, ts, turl, ttype, curl) in rows
+                (feed_id, guid, title, enc, pub, ts, turl, ttype, curl, desc, now)
+                for (guid, title, enc, pub, ts, turl, ttype, curl, desc) in rows
             ],
         )
         sel = conn.execute(
