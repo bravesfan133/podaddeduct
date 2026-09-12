@@ -17,10 +17,10 @@ logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "opencode/deepseek-v4-flash"
-GEMINI_FALLBACK_MODEL = "opencode/deepseek-v4-flash"
+GEMINI_DEFAULT_MODEL = "opencode/nemotron-3-ultra-free"
+GEMINI_FALLBACK_MODEL = "opencode/nemotron-3-ultra-free"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-OPENCODE_DEFAULT_MODEL = "deepseek-v4-flash"
+OPENCODE_DEFAULT_MODEL = "nemotron-3-ultra-free"
 OPENCODE_PROVIDER = "opencode"
 OPENCODE_MESSAGE_TIMEOUT = 300.0
 GEMINI_MAX_TRIES = 5

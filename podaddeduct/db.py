@@ -153,10 +153,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE episodes SET pub_ts = ? WHERE id = ?", (ts, row["id"]))
     _migrate_opencode_detector(conn)
     _migrate_opencode_http_model(conn)
+    _migrate_nemotron_free_model(conn)
 
 
 def _migrate_opencode_http_model(conn: sqlite3.Connection) -> None:
-    """Map leftover CLI / free-tier model IDs to opencode/deepseek-v4-flash."""
+    """Map leftover CLI / free-tier model IDs to opencode/nemotron-3-ultra-free."""
     flag = conn.execute(
         "SELECT value FROM kv WHERE key = ?", ("_migrated_opencode_http",)
     ).fetchone()
@@ -168,19 +169,46 @@ def _migrate_opencode_http_model(conn: sqlite3.Connection) -> None:
         stripped = val.split("/", 1)[1].strip()
         conn.execute(
             "UPDATE kv SET value = ? WHERE key = ?",
-            (stripped or "opencode/deepseek-v4-flash", "gemini_model"),
+            (stripped or "opencode/nemotron-3-ultra-free", "gemini_model"),
         )
     row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
     val = ((row["value"] if row else "") or "").strip()
     if val in {"deepseek-v4-flash-free", "opencode/deepseek-v4-flash-free"}:
         conn.execute(
             "UPDATE kv SET value = ? WHERE key = ?",
-            ("opencode/deepseek-v4-flash", "gemini_model"),
+            ("opencode/nemotron-3-ultra-free", "gemini_model"),
         )
     conn.execute(
         "INSERT INTO kv (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         ("_migrated_opencode_http", "1"),
+    )
+
+
+def _migrate_nemotron_free_model(conn: sqlite3.Connection) -> None:
+    """Paid DeepSeek Flash leftovers become the free Nemotron default."""
+    flag = conn.execute(
+        "SELECT value FROM kv WHERE key = ?", ("_migrated_nemotron_free",)
+    ).fetchone()
+    if flag:
+        return
+    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
+    val = ((row["value"] if row else "") or "").strip()
+    flash = {
+        "deepseek-v4-flash",
+        "opencode/deepseek-v4-flash",
+        "deepseek-v4-flash-free",
+        "opencode/deepseek-v4-flash-free",
+    }
+    if val in flash:
+        conn.execute(
+            "UPDATE kv SET value = ? WHERE key = ?",
+            ("opencode/nemotron-3-ultra-free", "gemini_model"),
+        )
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("_migrated_nemotron_free", "1"),
     )
 
 

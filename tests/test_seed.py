@@ -187,4 +187,4 @@ def test_default_gemini_model():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["gemini_model"].default
-    assert default == "opencode/deepseek-v4-flash"
+    assert default == "opencode/nemotron-3-ultra-free"

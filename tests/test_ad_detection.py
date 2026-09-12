@@ -144,9 +144,9 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    assert seed_mod.gemini_model() == "opencode/deepseek-v4-flash"
-    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
-    assert seed_mod.gemini_model() == "opencode/deepseek-v4-flash"
+    assert seed_mod.gemini_model() == "opencode/nemotron-3-ultra-free"
+    db.set_global_settings({"gemini_model": "opencode/nemotron-3-ultra-free"})
+    assert seed_mod.gemini_model() == "opencode/nemotron-3-ultra-free"
 
 
 def _ok_serve_text(text):
@@ -187,7 +187,7 @@ class _ServeClient:
         return _FakeResp(200, {"ok": True})
 
 
-def test_opencode_serve_posts_deepseek_v4_flash(tmp_path, monkeypatch):
+def test_opencode_serve_posts_nemotron_ultra_free(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
@@ -216,7 +216,7 @@ def test_opencode_serve_posts_deepseek_v4_flash(tmp_path, monkeypatch):
     assert sess and msg
     body = msg[0][2]["json"]
     assert body["model"]["providerID"] == "opencode"
-    assert body["model"]["modelID"] == "deepseek-v4-flash"
+    assert body["model"]["modelID"] == "nemotron-3-ultra-free"
     assert "car commercial" in body["parts"][0]["text"]
     assert "car commercial" not in body["system"]
     assert "advertisement detection" in body["system"].lower()
@@ -274,7 +274,7 @@ def test_find_ads_uses_opencode(tmp_path, monkeypatch):
         result = seed_mod.find_ads_with_zen(transcript)
     assert len(result.ranges) == 1
     assert result.gemini_ok
-    assert calls and "deepseek-v4-flash" in (calls[0] or "")
+    assert calls and "nemotron-3-ultra-free" in (calls[0] or "")
 
 
 def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
@@ -457,11 +457,11 @@ def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "gemini_model": "opencode/deepseek-v4-flash"},
+            data={"settings_form": "1", "gemini_model": "opencode/nemotron-3-ultra-free"},
             follow_redirects=False,
         )
         assert r.status_code == 303
-    assert db.runtime_str("gemini_model") == "opencode/deepseek-v4-flash"
+    assert db.runtime_str("gemini_model") == "opencode/nemotron-3-ultra-free"
 
 
 def test_opencode_direct_routing(tmp_path, monkeypatch):
@@ -474,7 +474,7 @@ def test_opencode_direct_routing(tmp_path, monkeypatch):
             {"text": "Ad here.", "start": 10.0, "end": 40.0},
         ]
     }
-    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
+    db.set_global_settings({"gemini_model": "opencode/nemotron-3-ultra-free"})
 
     with patch.object(
         seed_mod,
@@ -486,7 +486,7 @@ def test_opencode_direct_routing(tmp_path, monkeypatch):
     assert len(res.ranges) == 1
     assert res.ranges[0].start == 10.0
     mock_gen.assert_called_once()
-    assert mock_gen.call_args[1]["model"] == "opencode/deepseek-v4-flash"
+    assert mock_gen.call_args[1]["model"] == "opencode/nemotron-3-ultra-free"
 
 
 def test_gemini_quota_falls_back_to_opencode(tmp_path, monkeypatch):
@@ -529,8 +529,10 @@ def test_reprocess_all_show_endpoint(tmp_path, monkeypatch):
     feed = db.create_feed(slug="show-a", upstream_url="https://example.com/rss", title="A")
     ep1 = db.upsert_episode(feed.id, guid="g1", title="E1", enclosure_url="https://x/1.mp3", pub_date=None)
     ep2 = db.upsert_episode(feed.id, guid="g2", title="E2", enclosure_url="https://x/2.mp3", pub_date=None)
+    ep3 = db.upsert_episode(feed.id, guid="g3", title="E3 pending", enclosure_url="https://x/3.mp3", pub_date=None)
     db.update_episode(ep1.id, status="ready")
     db.update_episode(ep2.id, status="ready")
+    db.update_episode(ep3.id, status="pending")
 
     queued = []
 
@@ -545,7 +547,36 @@ def test_reprocess_all_show_endpoint(tmp_path, monkeypatch):
         r = client.post(f"/shows/{feed.slug}/reprocess-all", follow_redirects=False)
         assert r.status_code == 303
         assert "reprocess=1" in r.headers["location"]
+        show = client.get(f"/shows/{feed.slug}")
+        assert show.status_code == 200
+        assert f'/episodes/{ep1.id}/recheck' in show.text
+        assert "Recheck" in show.text
+        assert "Reprocess all Ready episodes" in show.text
     assert sorted(queued) == sorted([(ep1.id, True), (ep2.id, True)])
+    assert ep3.id not in {eid for eid, _ in queued}
+
+
+def test_recheck_from_show_stays_on_show(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from podaddeduct.app import app
+
+    feed = db.create_feed(slug="show-b", upstream_url="https://example.com/rss", title="B")
+    ep = db.upsert_episode(feed.id, guid="g1", title="E1", enclosure_url="https://x/1.mp3", pub_date=None)
+    db.update_episode(ep.id, status="ready")
+
+    with (
+        patch("podaddeduct.app.enqueue_episode", return_value=True),
+        TestClient(app) as client,
+    ):
+        r = client.post(
+            f"/episodes/{ep.id}/recheck",
+            headers={"Referer": f"http://testserver/shows/{feed.slug}"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == f"/shows/{feed.slug}"
 
 
 def test_parse_timestamp_helpers():

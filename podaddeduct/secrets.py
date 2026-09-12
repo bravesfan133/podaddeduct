@@ -83,7 +83,7 @@ def gemini_key_status() -> dict:
         "configured": bool(stored or env),
         "source": source,
         "hint": hint,
-        "model": _db.runtime_str("gemini_model") or "opencode/deepseek-v4-flash",
+        "model": _db.runtime_str("gemini_model") or "opencode/nemotron-3-ultra-free",
     }
 
 

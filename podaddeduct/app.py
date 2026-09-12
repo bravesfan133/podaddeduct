@@ -855,7 +855,7 @@ async def prepare_next(slug: str, request: Request) -> RedirectResponse:
 
 @app.post("/shows/{slug}/reprocess-all")
 async def reprocess_show(slug: str, request: Request) -> RedirectResponse:
-    """Re-queue every episode of a show for ad re-detection (keeps transcripts)."""
+    """Re-queue Ready episodes of a show for ad re-detection (keeps transcripts)."""
     if not _authed(request):
         return RedirectResponse("/login", status_code=303)
     feed = db.get_feed_by_slug(slug)
@@ -863,6 +863,8 @@ async def reprocess_show(slug: str, request: Request) -> RedirectResponse:
         raise HTTPException(404, "Show not found")
     queued = 0
     for ep in db.list_episodes(feed.id):
+        if ep.status not in {"ready", "manual"}:
+            continue
         if await enqueue_episode(ep.id, reseed=True):
             queued += 1
     return RedirectResponse(f"/shows/{slug}?queued={queued}&reprocess=1", status_code=303)
@@ -954,6 +956,11 @@ async def recheck_episode(episode_id: int, request: Request) -> RedirectResponse
     if not ep:
         raise HTTPException(404, "Episode not found")
     await enqueue_episode(episode_id, reseed=True)
+    from urllib.parse import urlparse as _urlparse
+
+    path = _urlparse(request.headers.get("referer") or "").path
+    if path.startswith("/shows/"):
+        return RedirectResponse(path, status_code=303)
     return RedirectResponse(f"/episodes/{episode_id}", status_code=303)
 
 

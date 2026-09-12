@@ -57,7 +57,7 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key"),
     )
-    gemini_model: str = "opencode/deepseek-v4-flash"
+    gemini_model: str = "opencode/nemotron-3-ultra-free"
     opencode_server_url: str = "http://127.0.0.1:4096"
     zen_api_key: str | None = Field(
         default=None,

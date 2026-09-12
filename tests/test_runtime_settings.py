@@ -15,6 +15,15 @@ def _setup(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_migrate_flash_to_nemotron_free(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
+    with db.connect() as conn:
+        conn.execute("DELETE FROM kv WHERE key = ?", ("_migrated_nemotron_free",))
+    db.init_db()
+    assert db.runtime_str("gemini_model") == "opencode/nemotron-3-ultra-free"
+
+
 def test_migrate_clears_leftover_gemini_model(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     db.set_global_settings({"gemini_model": "gemini-3.6-flash"})
@@ -205,7 +214,7 @@ def test_settings_page_renders(tmp_path, monkeypatch):
         assert "adDetectionTest" in r.text
         assert "geminiTest" not in r.text
         assert "opencode serve" in r.text
-        assert "opencode/deepseek-v4-flash" in r.text
+        assert "opencode/nemotron-3-ultra-free" in r.text
         assert "opencodeHealthWarn" not in r.text
 
 

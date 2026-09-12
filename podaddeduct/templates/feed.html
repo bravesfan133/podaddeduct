@@ -15,6 +15,8 @@
     .showhead { display:flex; gap:1rem; align-items:center; }
     .showhead img { width:72px; height:72px; border-radius:12px; }
     .row { display:flex; gap:1rem; flex-wrap:wrap; align-items:end; }
+    .status-ready { display:inline-flex; align-items:center; gap:0.45rem; flex-wrap:wrap; }
+    .recheck-btn { margin:0 !important; padding:0.2rem 0.55rem; font-size:0.8rem; }
   </style>
 </head>
 <body>
@@ -46,7 +48,7 @@
     <form method="post" action="/shows/{{ feed.slug }}/prepare" style="display:inline">
       <button type="submit" class="ghost">Prepare next 5</button>
     </form>
-    <form method="post" action="/shows/{{ feed.slug }}/reprocess-all" style="display:inline" onsubmit="return confirm('Reprocess all episodes of this show? This re-runs ad detection using existing transcripts.')">
+    <form method="post" action="/shows/{{ feed.slug }}/reprocess-all" style="display:inline" onsubmit="return confirm('Reprocess all Ready episodes of this show? This re-runs ad detection using existing transcripts.')">
       <button type="submit" class="ghost">Reprocess all</button>
     </form>
     <form method="post" action="/shows/{{ feed.slug }}/delete" style="display:inline" onsubmit="return confirm('Remove this show and delete its downloaded files?')">
@@ -73,7 +75,7 @@
       <tr data-ep-id="{{ r.ep.id }}" data-ep-status="{{ r.ep.status }}">
         <td><a href="/episodes/{{ r.ep.id }}">{{ r.ep.title }}</a><br /><span class="muted">{{ r.ep.pub_date or '' }}</span></td>
         <td data-status-cell>
-          {% if r.ep.status == 'ready' or r.ep.status == 'manual' %}<span class="pill ok">Ready</span>
+          {% if r.ep.status == 'ready' or r.ep.status == 'manual' %}<span class="status-ready"><span class="pill ok">Ready</span><form method="post" action="/episodes/{{ r.ep.id }}/recheck" style="display:inline;margin:0"><button type="submit" class="ghost recheck-btn">Recheck</button></form></span>
           {% elif r.ep.status == 'working' %}<span class="pill warn">Cleaning…</span>
           {% elif r.ep.status == 'error' %}<span class="pill warn">Needs attention</span>
           {% else %}<span class="pill">New</span>{% endif %}
@@ -103,6 +105,12 @@ function fmtTime(sec) {
 function fmtSaved(sec) {
   const s = Math.max(0, Math.floor(Number(sec) || 0));
   return ((s / 60) | 0) + ':' + String(s % 60).padStart(2, '0');
+}
+function recheckForm(id) {
+  return `<span class="status-ready"><span class="pill ok">Ready</span>
+    <form method="post" action="/episodes/${id}/recheck" style="display:inline;margin:0">
+      <button type="submit" class="ghost recheck-btn">Recheck</button>
+    </form></span>`;
 }
 
 function forThisShow(item) {
@@ -195,7 +203,7 @@ function updateTableRows(data) {
     }
     if (recentMap[id]) {
       const r = recentMap[id];
-      statusCell.innerHTML = '<span class="pill ok">Ready</span>';
+      statusCell.innerHTML = recheckForm(id);
       if (savedCell) {
         savedCell.textContent = r.ads
           ? `${r.ads} ads · ${fmtSaved(r.saved_seconds)}`

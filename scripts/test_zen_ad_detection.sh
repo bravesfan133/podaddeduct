@@ -5,12 +5,12 @@
 #   ./scripts/test_zen_ad_detection.sh
 #
 # Optional:
-#   URL=http://127.0.0.1:4096 MODEL=deepseek-v4-flash ./scripts/test_zen_ad_detection.sh
+#   URL=http://127.0.0.1:4096 MODEL=nemotron-3-ultra-free ./scripts/test_zen_ad_detection.sh
 
 set -eu
 
 URL="${URL:-http://127.0.0.1:4096}"
-MODEL="${MODEL:-deepseek-v4-flash}"
+MODEL="${MODEL:-nemotron-3-ultra-free}"
 
 echo "GET $URL/global/health"
 if ! curl -sS -f "$URL/global/health"; then

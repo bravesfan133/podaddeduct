@@ -12,7 +12,7 @@ cp -n .env.example .env 2>/dev/null || true
 
 Open `http://127.0.0.1:8080/`:
 
-1. **Search** for a show by name, press Add. Ad detection uses local `opencode serve` (`opencode/deepseek-v4-flash`). Paste your Zen key in Settings. Optional Gemini is under Settings → Ad detection → Gemini.
+1. **Search** for a show by name, press Add. Ad detection uses local `opencode serve` (`opencode/nemotron-3-ultra-free`). Paste your Zen key in Settings. Optional Gemini is under Settings → Ad detection → Gemini.
 2. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
 3. **Play.** New episodes prepare automatically; first play waits until the clean file is ready (never streams the with-ads original). Afterwards it's instant.
 
@@ -34,7 +34,7 @@ Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
 2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
-3. Cheap **sponsor-read heuristics**, then **OpenCode serve** (`opencode/deepseek-v4-flash`) in one shot.
+3. Cheap **sponsor-read heuristics**, then **OpenCode serve** (`opencode/nemotron-3-ultra-free`) in one shot.
 4. Snap to silence, cut with ffmpeg (ID3 tags and cover art preserved).
 
 Everything is configured in **Settings** — no config files needed:
