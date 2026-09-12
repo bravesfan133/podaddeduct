@@ -60,8 +60,18 @@
     <form method="post" action="/settings/global">
       <input type="hidden" name="settings_form" value="1" />
       <div class="row">
+        <div><label>Provider</label><select name="llm_provider">
+          <option value="groq" {% if effective.llm_provider == 'groq' %}selected{% endif %}>Groq (works — same key as transcription)</option>
+          <option value="zen" {% if effective.llm_provider == 'zen' %}selected{% endif %}>OpenCode Zen</option>
+        </select></div>
+      </div>
+      <div class="row">
         <div><label>Main model</label><input name="zen_model" type="text" list="zen-models" value="{{ global_settings.zen_model }}" placeholder="{{ effective.zen_model }}" /></div>
         <div><label>Backup model</label><input name="zen_fallback_model" type="text" list="zen-models" value="{{ global_settings.zen_fallback_model }}" placeholder="{{ effective.zen_fallback_model }}" /></div>
+      </div>
+      <div class="row">
+        <div><label>Groq main model</label><input name="groq_llm_model" type="text" value="{{ global_settings.groq_llm_model }}" placeholder="{{ effective.groq_llm_model }}" /></div>
+        <div><label>Groq backup model</label><input name="groq_llm_fallback_model" type="text" value="{{ global_settings.groq_llm_fallback_model }}" placeholder="{{ effective.groq_llm_fallback_model }}" /></div>
       </div>
       <datalist id="zen-models"></datalist>
       <p class="sub" id="zen-models-note" style="font-size:0.8rem"></p>

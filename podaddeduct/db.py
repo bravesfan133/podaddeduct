@@ -575,6 +575,10 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "zen_fallback_model": "",
     "zen_base_url": "",
     "zen_chunk_chars": "",
+    # Ad-detection LLM provider + Groq models
+    "llm_provider": "",
+    "groq_llm_model": "",
+    "groq_llm_fallback_model": "",
     # Transcription backend
     "stt_python": "",
     "stt_sidecar": "",
@@ -598,6 +602,9 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "zen_fallback_model": "zen_fallback_model",
     "zen_base_url": "zen_base_url",
     "zen_chunk_chars": "zen_chunk_chars",
+    "llm_provider": "llm_provider",
+    "groq_llm_model": "groq_llm_model",
+    "groq_llm_fallback_model": "groq_llm_fallback_model",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",
     "stt_model": "stt_model",

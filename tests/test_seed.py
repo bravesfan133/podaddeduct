@@ -87,7 +87,7 @@ def test_find_ads_with_zen_mocked():
     from podaddeduct import db as db_mod
     from podaddeduct import seed as seed_mod
 
-    def fake_responses(api_key, model, user_content):
+    def fake_responses(provider, api_key, model, user_content):
         if "Acme" in user_content or "brought to you" in user_content:
             return '[{"start": 4.0, "end": 30.0}]'
         if "Midroll" in user_content or "car commercial" in user_content:
@@ -102,8 +102,9 @@ def test_find_ads_with_zen_mocked():
         return real_runtime_int(key, **kwargs)
 
     with (
+        patch.object(seed_mod, "ad_provider", return_value="zen"),
         patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
-        patch.object(seed_mod, "_zen_call", side_effect=fake_responses),
+        patch.object(seed_mod, "_llm_call", side_effect=fake_responses),
         patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
     ):
         ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)

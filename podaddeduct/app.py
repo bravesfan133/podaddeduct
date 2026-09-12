@@ -404,6 +404,9 @@ async def settings_page(request: Request) -> HTMLResponse:
         "zen_fallback_model": db.runtime_str("zen_fallback_model"),
         "zen_base_url": db.runtime_str("zen_base_url"),
         "zen_chunk_chars": db.runtime_int("zen_chunk_chars", minimum=1000),
+        "llm_provider": db.runtime_str("llm_provider"),
+        "groq_llm_model": db.runtime_str("groq_llm_model"),
+        "groq_llm_fallback_model": db.runtime_str("groq_llm_fallback_model"),
         "stt_python": db.runtime_str("stt_python"),
         "stt_sidecar": db.runtime_str("stt_sidecar"),
         "stt_model": db.runtime_str("stt_model"),
@@ -592,10 +595,17 @@ async def save_global_settings(request: Request) -> RedirectResponse:
             maximum=500 if k == "feed_item_limit" else (10**6 if k == "zen_chunk_chars" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50))
 
     for k in ("zen_model", "zen_fallback_model", "zen_base_url",
+              "groq_llm_model", "groq_llm_fallback_model",
               "stt_python", "stt_sidecar", "stt_model"):
         raw = form.get(k)
         if raw not in (None, ""):
             updates[k] = str(raw).strip()
+
+    provider = str(form.get("llm_provider") or "").strip().lower()
+    if provider in ("groq", "zen"):
+        updates["llm_provider"] = provider
+    elif provider:
+        errors.append("Unknown ad-detection provider (pick Groq or Zen).")
 
     raw_base = str(form.get("public_base_url") or "").strip().rstrip("/")
     if raw_base:

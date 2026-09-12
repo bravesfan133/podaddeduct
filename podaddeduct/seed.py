@@ -243,28 +243,114 @@ def _zen_call(api_key: str, model: str, user_content: str) -> str:
     return _zen_chat_completions(api_key, model, user_content)
 
 
+def ad_provider() -> str:
+    """Effective ad-detection LLM provider: UI wins over env/default."""
+    from . import db
+
+    return (db.runtime_str("llm_provider") or "groq").strip().lower() or "groq"
+
+
+def ad_models_to_try() -> list[tuple[str, str]]:
+    """(provider, model) pairs to try in order for ad detection."""
+    from . import db
+
+    provider = ad_provider()
+    if provider == "groq":
+        keys = ("groq_llm_model", "groq_llm_fallback_model")
+    else:
+        keys = ("zen_model", "zen_fallback_model")
+    ordered: list[tuple[str, str]] = []
+    for key in keys:
+        mid = db.runtime_str(key).strip()
+        if mid and (provider, mid) not in ordered:
+            ordered.append((provider, mid))
+    return ordered
+
+
+def resolve_ad_api_key(provider: str) -> str | None:
+    if provider == "groq":
+        from .secrets import get_groq_api_key
+
+        return get_groq_api_key()
+    return resolve_zen_api_key()
+
+
+def _llm_call(provider: str, api_key: str, model: str, user_content: str) -> str:
+    if provider == "groq":
+        return _groq_chat(api_key, model, user_content)
+    return _zen_call(api_key, model, user_content)
+
+
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_CHAT_MAX_TRIES = 4
+
+
+def _groq_chat(api_key: str, model: str, user_content: str) -> str:
+    """OpenAI-compatible chat completions via Groq (ad detection LLM)."""
+    import time
+
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    last_err = ""
+    with httpx.Client(timeout=180.0) as client:
+        for attempt in range(1, GROQ_CHAT_MAX_TRIES + 1):
+            try:
+                resp = client.post(GROQ_CHAT_URL, headers=headers, json=payload)
+            except httpx.HTTPError as exc:
+                last_err = f"{type(exc).__name__}: {exc}"
+                resp = None
+            else:
+                if resp.status_code < 400:
+                    data = resp.json() if isinstance(resp.json(), dict) else {}
+                    choices = data.get("choices") or []
+                    if not choices:
+                        raise RuntimeError("Groq returned no choices")
+                    msg = choices[0].get("message") or {}
+                    return str(msg.get("content") or "")
+                last_err = f"{resp.status_code} {resp.text[:300]}"
+                if resp.status_code not in (408, 425, 429, 500, 502, 503, 504):
+                    raise httpx.HTTPStatusError(
+                        last_err, request=resp.request, response=resp
+                    )
+            if attempt < GROQ_CHAT_MAX_TRIES:
+                wait = 5 * 2 ** (attempt - 1)
+                try:
+                    if resp is not None:
+                        wait = min(120.0, float(resp.headers.get("retry-after", "") or wait))
+                except (TypeError, ValueError):
+                    pass
+                logger.warning("Groq chat attempt %d failed, retry in %.0fs: %s", attempt, wait, last_err)
+                time.sleep(wait)
+    raise RuntimeError(f"Groq chat failed after {GROQ_CHAT_MAX_TRIES} tries: {last_err}")
+
+
 CURATED_ZEN_MODELS = [
     "muse-spark-1.3-contributor-free",
     "deepseek-v4-flash-free",
 ]
 
+CURATED_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
 
-def fetch_zen_models() -> dict:
-    """List model ids from the Zen API using the resolved key.
 
-    Returns {"models": [...], "live": True} or {"models": curated, "live": False}.
-    Never raises — the UI must work before any key is configured.
-    """
-    from . import db
-
-    api_key = resolve_zen_api_key()
-    base = (db.runtime_str("zen_base_url") or "").rstrip("/")
-    if not api_key or not base:
-        return {"models": list(CURATED_ZEN_MODELS), "live": False}
+def _live_model_ids(base: str, api_key: str, *, path: str = "/models") -> list[str] | None:
+    """Fetch model ids from an OpenAI-style /models endpoint. None on failure."""
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(
-                base + "/models",
+                base.rstrip("/") + path,
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             resp.raise_for_status()
@@ -276,12 +362,39 @@ def fetch_zen_models() -> dict:
                 mid = item.get("id") if isinstance(item, dict) else None
                 if mid and mid not in ids:
                     ids.append(str(mid))
-        if not ids:
-            return {"models": list(CURATED_ZEN_MODELS), "live": False}
-        return {"models": sorted(ids)[:200], "live": True}
+        return sorted(ids)[:200] or None
     except Exception as exc:
-        logger.warning("Zen /models failed, using curated list: %s", exc)
+        logger.warning("Live /models failed for %s, using curated list: %s", base, exc)
+        return None
+
+
+def fetch_zen_models() -> dict:
+    """List model ids for the effective ad-detection provider.
+
+    Returns {"models": [...], "live": True} or {"models": curated, "live": False}.
+    Never raises — the UI must work before any key is configured.
+    (Name kept for the existing /api/zen-models route.)
+    """
+    from . import db
+
+    provider = ad_provider()
+    if provider == "groq":
+        api_key = resolve_ad_api_key(provider)
+        if not api_key:
+            return {"models": list(CURATED_GROQ_MODELS), "live": False}
+        ids = _live_model_ids("https://api.groq.com/openai/v1", api_key)
+        if not ids:
+            return {"models": list(CURATED_GROQ_MODELS), "live": False}
+        return {"models": ids, "live": True}
+
+    api_key = resolve_zen_api_key()
+    base = (db.runtime_str("zen_base_url") or "").rstrip("/")
+    if not api_key or not base:
         return {"models": list(CURATED_ZEN_MODELS), "live": False}
+    ids = _live_model_ids(base, api_key)
+    if not ids:
+        return {"models": list(CURATED_ZEN_MODELS), "live": False}
+    return {"models": ids, "live": True}
 
 
 def test_zen_connection(model: str | None = None) -> dict:
@@ -289,30 +402,41 @@ def test_zen_connection(model: str | None = None) -> dict:
     from . import db
 
     try:
-        api_key = resolve_zen_api_key()
+        provider = ad_provider()
+        api_key = resolve_ad_api_key(provider)
         if not api_key:
             return {"ok": False, "error": "No API key saved yet."}
-        use_model = (model or "").strip() or (db.models_to_try() + [""])[0]
+        if (model or "").strip():
+            candidates = [(provider, model.strip())]
+        else:
+            candidates = ad_models_to_try() or [(provider, "")]
+        use_provider, use_model = candidates[0]
         if not use_model:
             return {"ok": False, "error": "No model selected."}
         import time
 
         start = time.monotonic()
-        raw = _zen_call(api_key, use_model, "Return exactly: []")
+        raw = _llm_call(use_provider, api_key, use_model, "Return exactly: []")
         parsed = _extract_json_array(raw)
         ms = int((time.monotonic() - start) * 1000)
-        return {"ok": True, "model": use_model, "ms": ms, "ranges": len(parsed)}
+        return {"ok": True, "provider": use_provider, "model": use_model, "ms": ms, "ranges": len(parsed)}
     except Exception as exc:
-        logger.warning("Zen test failed: %s", exc)
+        logger.warning("Ad-detection test failed: %s", exc)
         return {"ok": False, "error": str(exc)[-300:]}
 
 
 def find_ads_with_zen(transcript: dict) -> list[Interval]:
-    """Call Zen free models on transcript chunks; merge all ad ranges."""
+    """Run transcript chunks through the configured ad-detection LLM."""
     from . import db
 
-    api_key = resolve_zen_api_key()
+    provider = ad_provider()
+    api_key = resolve_ad_api_key(provider)
     if not api_key:
+        if provider == "groq":
+            raise RuntimeError(
+                "No Groq API key. Paste one in Settings → Server (Groq key field). "
+                "Get a free key at https://console.groq.com."
+            )
         raise RuntimeError(
             "No OpenCode Zen API key. Paste one on the home page (or set ZEN_API_KEY / OPENCODE_API_KEY). "
             "Get a key at https://opencode.ai/auth — default free model is muse-spark-1.3-contributor-free "
@@ -323,7 +447,9 @@ def find_ads_with_zen(transcript: dict) -> list[Interval]:
     if not chunks:
         return []
 
-    models = db.models_to_try()
+    models = ad_models_to_try()
+    if not models:
+        raise RuntimeError(f"No {provider} model selected. Pick one in Settings → Ad detection.")
 
     all_ranges: list[Interval] = []
     for i, chunk in enumerate(chunks):
@@ -335,12 +461,13 @@ def find_ads_with_zen(transcript: dict) -> list[Interval]:
         parsed: list[dict] | None = None
         last_err: Exception | None = None
         raw = ""
-        for model in models:
+        for use_provider, model in models:
             try:
-                raw = _zen_call(api_key, model, user)
+                raw = _llm_call(use_provider, api_key, model, user)
                 parsed = _extract_json_array(raw)
                 logger.info(
-                    "Zen %s chunk %s/%s -> %d ranges",
+                    "%s %s chunk %s/%s -> %d ranges",
+                    use_provider,
                     model,
                     i + 1,
                     len(chunks),
@@ -350,14 +477,15 @@ def find_ads_with_zen(transcript: dict) -> list[Interval]:
             except Exception as exc:
                 last_err = exc
                 logger.warning(
-                    "Zen model %s failed on chunk %s: %s; raw=%r",
+                    "%s model %s failed on chunk %s: %s; raw=%r",
+                    use_provider,
                     model,
                     i + 1,
                     exc,
                     (raw or "")[:500],
                 )
         if parsed is None:
-            raise RuntimeError(f"Zen failed on chunk {i + 1}: {last_err}")
+            raise RuntimeError(f"Ad detection failed on chunk {i + 1}: {last_err}")
         for r in parsed:
             all_ranges.append(Interval(float(r["start"]), float(r["end"])))
 

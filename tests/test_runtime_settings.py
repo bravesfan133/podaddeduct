@@ -131,10 +131,21 @@ def test_zen_models_falls_back_without_key(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    with patch.object(seed_mod, "resolve_zen_api_key", return_value=None):
+    with (
+        patch.object(seed_mod, "ad_provider", return_value="zen"),
+        patch.object(seed_mod, "resolve_zen_api_key", return_value=None),
+    ):
         out = seed_mod.fetch_zen_models()
     assert out["live"] is False
     assert "muse-spark-1.3-contributor-free" in out["models"]
+
+    with (
+        patch.object(seed_mod, "ad_provider", return_value="groq"),
+        patch.object(seed_mod, "resolve_ad_api_key", return_value=None),
+    ):
+        out = seed_mod.fetch_zen_models()
+    assert out["live"] is False
+    assert "llama-3.3-70b-versatile" in out["models"]
 
 
 def test_zen_test_reports_no_key(tmp_path, monkeypatch):
@@ -143,6 +154,7 @@ def test_zen_test_reports_no_key(tmp_path, monkeypatch):
     from podaddeduct.app import app
 
     with (
+        patch.object(seed_mod, "ad_provider", return_value="zen"),
         patch.object(seed_mod, "resolve_zen_api_key", return_value=None),
         TestClient(app) as client,
     ):
