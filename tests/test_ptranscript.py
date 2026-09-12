@@ -212,6 +212,8 @@ def test_groq_key_route(tmp_path, monkeypatch):
 
 def test_process_module_exposes_transcribe_audio():
     # Regression: a refactor once dropped this import → NameError at runtime.
+    # Extended after transcript_path_for suffered the same fate.
     from podaddeduct import process
 
     assert callable(process.transcribe_audio)
+    assert callable(process.transcript_path_for)

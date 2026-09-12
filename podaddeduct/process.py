@@ -14,7 +14,7 @@ from .decode import load_mono_pcm
 from .download import complete_marker_for, download_file
 from .intervals import Interval
 from .seed import filter_min_duration, find_ads_with_zen, snap_to_silence
-from .stt import transcribe_audio
+from .stt import transcribe_audio, transcript_path_for
 
 logger = logging.getLogger("podaddeduct.process")
 
