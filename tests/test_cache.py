@@ -44,8 +44,10 @@ def test_janitor_keep_last(tmp_path, monkeypatch):
     db.update_feed_settings(feed.id, {"keep_last": 2})
     ids = []
     for i in range(4):
+        # Distinct dates: g3 newest. Ordering must follow pubdate, not row id.
         ep = db.upsert_episode(feed.id, guid=f"g{i}", title=f"E{i}",
-                               enclosure_url=f"https://e/{i}.mp3", pub_date=None)
+                               enclosure_url=f"https://e/{i}.mp3",
+                               pub_date=f"Mon, 0{i + 1} Jan 2026 00:00:00 GMT")
         p = tmp_path / "audio" / f"{ep.id}.clean.mp3"
         p.write_bytes(b"x" * 100)
         db.update_episode(ep.id, clean_audio_path=str(p), size_bytes=100, status="ready")
@@ -91,7 +93,7 @@ def test_audio_head_queues_nothing(tmp_path, monkeypatch):
     assert db.get_episode(ep.id).status == "pending"
 
 
-def test_audio_get_redirects_upstream_while_working(tmp_path, monkeypatch):
+def test_audio_503_queues_priority_while_working(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct.app import app
     from podaddeduct.process import _queued
@@ -101,9 +103,11 @@ def test_audio_get_redirects_upstream_while_working(tmp_path, monkeypatch):
                            enclosure_url="https://example.com/ep.mp3", pub_date=None)
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.get(f"/audio/{ep.id}", follow_redirects=False)
-    # Plays original immediately while background work starts — never blocks.
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "https://example.com/ep.mp3"
+    # Strict: never serve with-ads bytes. 503 + retry while cleaning runs.
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "60"
+    assert "location" not in resp.headers
+    assert ep.id in _queued or db.get_episode(ep.id).status in ("pending", "working")
     _queued.discard(ep.id)
 
 

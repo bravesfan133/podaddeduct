@@ -37,16 +37,33 @@ class Episode:
     title: str
     enclosure_url: str
     pub_date: str | None
-    duration_seconds: float | None
-    status: str
-    audio_path: str | None
-    ad_ranges_json: str
-    content_fp_path: str | None
-    clean_audio_path: str | None
-    error: str | None
-    updated_at: str
+    pub_ts: float = 0.0
+    duration_seconds: float | None = None
+    status: str = "pending"
+    audio_path: str | None = None
+    ad_ranges_json: str = "[]"
+    content_fp_path: str | None = None
+    clean_audio_path: str | None = None
+    error: str | None = None
+    updated_at: str = ""
     size_bytes: int = 0
     last_served_at: str | None = None
+
+
+def pub_ts_for(pub_date: str | None) -> float:
+    """Sortable publish timestamp. 0.0 when the date is missing/unparseable."""
+    if not pub_date:
+        return 0.0
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(str(pub_date))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    try:
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
 
 
 SCHEMA = """
@@ -65,6 +82,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     title TEXT NOT NULL DEFAULT '',
     enclosure_url TEXT NOT NULL,
     pub_date TEXT,
+    pub_ts REAL NOT NULL DEFAULT 0,
     duration_seconds REAL,
     status TEXT NOT NULL DEFAULT 'pending',
     audio_path TEXT,
@@ -99,6 +117,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE episodes ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
     if "last_served_at" not in ep_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN last_served_at TEXT")
+    if "pub_ts" not in ep_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN pub_ts REAL NOT NULL DEFAULT 0")
+    # Backfill sortable timestamps for rows written before pub_ts existed.
+    try:
+        stale = conn.execute(
+            "SELECT id, pub_date FROM episodes WHERE pub_ts = 0 AND pub_date IS NOT NULL AND pub_date != ''"
+        ).fetchall()
+    except Exception:
+        stale = []
+    for row in stale:
+        ts = pub_ts_for(row["pub_date"])
+        if ts > 0:
+            conn.execute("UPDATE episodes SET pub_ts = ? WHERE id = ?", (ts, row["id"]))
 
 
 def init_db() -> None:
@@ -146,6 +177,7 @@ def _episode_from_row(row: sqlite3.Row) -> Episode:
         title=row["title"],
         enclosure_url=row["enclosure_url"],
         pub_date=row["pub_date"],
+        pub_ts=float(row["pub_ts"] or 0.0) if "pub_ts" in keys else 0.0,
         duration_seconds=row["duration_seconds"],
         status=row["status"],
         audio_path=row["audio_path"],
@@ -217,9 +249,12 @@ def get_episode_by_guid(feed_id: int, guid: str) -> Episode | None:
 
 
 def list_episodes(feed_id: int) -> list[Episode]:
+    # Newest first by actual publish date. (Row id order is oldest-last:
+    # the newest upstream item is inserted first, so id order alone
+    # shows oldest first — hence pub_ts, not id.)
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM episodes WHERE feed_id = ? ORDER BY id DESC",
+            "SELECT * FROM episodes WHERE feed_id = ? ORDER BY pub_ts DESC, id ASC",
             (feed_id,),
         ).fetchall()
     return [_episode_from_row(r) for r in rows]
@@ -234,6 +269,7 @@ def upsert_episode(
 ) -> Episode:
     existing = get_episode_by_guid(feed_id, guid)
     now = _utc_now()
+    ts = pub_ts_for(pub_date)
     if existing:
         enclosure_changed = existing.enclosure_url != enclosure_url
         with connect() as conn:
@@ -242,21 +278,21 @@ def upsert_episode(
                 conn.execute(
                     """
                     UPDATE episodes
-                    SET title = ?, enclosure_url = ?, pub_date = ?, updated_at = ?,
+                    SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?,
                         audio_path = NULL, status = 'pending', error = NULL,
                         ad_ranges_json = '[]', clean_audio_path = NULL
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, now, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, existing.id),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE episodes
-                    SET title = ?, enclosure_url = ?, pub_date = ?, updated_at = ?
+                    SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, now, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, existing.id),
                 )
         ep = get_episode(existing.id)
         assert ep is not None
@@ -266,16 +302,78 @@ def upsert_episode(
         cur = conn.execute(
             """
             INSERT INTO episodes (
-                feed_id, guid, title, enclosure_url, pub_date,
+                feed_id, guid, title, enclosure_url, pub_date, pub_ts,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             """,
-            (feed_id, guid, title, enclosure_url, pub_date, now),
+            (feed_id, guid, title, enclosure_url, pub_date, ts, now),
         )
         episode_id = int(cur.lastrowid)
     ep = get_episode(episode_id)
     assert ep is not None
     return ep
+
+
+def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
+    """Upsert many episodes in a single transaction, preserving input order.
+
+    A big show (1600+ episodes) upserted row-by-row costs one open/commit/
+    fsync per row — ~50s on slow disks, on EVERY feed view. One transaction
+    with a single commit: well under a second. Same per-row semantics as
+    upsert_episode (enclosure change resets processing state).
+    Items: dicts with guid/title/enclosure_url/pub_date keys.
+    """
+    now = _utc_now()
+    rows = [
+        (
+            str(it["guid"]),
+            str(it.get("title") or "Episode"),
+            str(it["enclosure_url"]),
+            it.get("pub_date"),
+            pub_ts_for(it.get("pub_date")),
+        )
+        for it in items
+        if it.get("guid") and it.get("enclosure_url")
+    ]
+    if not rows:
+        return []
+    with connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO episodes (
+                feed_id, guid, title, enclosure_url, pub_date, pub_ts,
+                status, ad_ranges_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ON CONFLICT(feed_id, guid) DO UPDATE SET
+                title = excluded.title,
+                enclosure_url = excluded.enclosure_url,
+                pub_date = excluded.pub_date,
+                pub_ts = excluded.pub_ts,
+                updated_at = excluded.updated_at,
+                audio_path = CASE
+                    WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
+                    ELSE episodes.audio_path END,
+                clean_audio_path = CASE
+                    WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
+                    ELSE episodes.clean_audio_path END,
+                ad_ranges_json = CASE
+                    WHEN episodes.enclosure_url != excluded.enclosure_url THEN '[]'
+                    ELSE episodes.ad_ranges_json END,
+                status = CASE
+                    WHEN episodes.enclosure_url != excluded.enclosure_url THEN 'pending'
+                    ELSE episodes.status END,
+                error = CASE
+                    WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
+                    ELSE episodes.error END
+            """,
+            [(feed_id, guid, title, enc, pub, ts, now) for (guid, title, enc, pub, ts) in rows],
+        )
+        sel = conn.execute(
+            f"SELECT * FROM episodes WHERE feed_id = ? AND guid IN ({','.join('?' * len(rows))})",
+            [feed_id] + [r[0] for r in rows],
+        ).fetchall()
+    by_guid = {r["guid"]: _episode_from_row(r) for r in sel}
+    return [by_guid[r[0]] for r in rows if r[0] in by_guid]
 
 
 def update_episode(episode_id: int, **fields: Any) -> Episode:
@@ -334,9 +432,18 @@ def has_clean_audio(episode: Episode) -> bool:
 
 DEFAULT_FEED_SETTINGS: dict[str, Any] = {
     "auto_download": True,  # prepare latest episode automatically
-    "keep_last": 5,  # how many recent cleaned episodes to keep
+    # None = inherit the global keep_last_n. New shows always inherit;
+    # clearing the field on the show page reverts to inherit.
+    "keep_last": None,  # how many recent cleaned episodes to keep
     "mode": "cut",  # "cut" = remove ads from file, "chapters" = mark only, ~0 storage
 }
+
+
+def global_keep_last() -> int:
+    try:
+        return max(1, int(get_global_settings().get("keep_last_n") or 5))
+    except ValueError:
+        return 5
 
 
 def get_feed_settings(feed: Feed) -> dict[str, Any]:
@@ -349,20 +456,41 @@ def get_feed_settings(feed: Feed) -> dict[str, Any]:
         for k, v in data.items():
             if k in merged:
                 merged[k] = v
+    if merged.get("keep_last") is None:
+        merged["keep_last"] = global_keep_last()
     return merged
+
+
+def feed_keep_last_raw(feed: Feed) -> Any:
+    """The show's own override, or None when inheriting the global value."""
+    try:
+        data = json.loads(feed.settings_json or "{}")
+    except json.JSONDecodeError:
+        return None
+    return data.get("keep_last") if isinstance(data, dict) else None
 
 
 def update_feed_settings(feed_id: int, updates: dict[str, Any]) -> Feed:
     feed = get_feed(feed_id)
     assert feed is not None
-    current = get_feed_settings(feed)
+    # Start from the raw stored JSON (not the resolved view) so an
+    # inherited keep_last=None stays inherited when other keys change.
+    try:
+        raw = json.loads(feed.settings_json or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    # Persist the raw overrides (keep_last=None stays inherited) rather
+    # than the resolved view, so inherit sticks when other keys change.
+    stored: dict[str, Any] = {k: v for k, v in raw.items() if k in DEFAULT_FEED_SETTINGS}
     for k, v in updates.items():
         if k in DEFAULT_FEED_SETTINGS:
-            current[k] = v
+            stored[k] = v
     with connect() as conn:
         conn.execute(
             "UPDATE feeds SET settings_json = ? WHERE id = ?",
-            (json.dumps(current), feed_id),
+            (json.dumps(stored), feed_id),
         )
     updated = get_feed(feed_id)
     assert updated is not None

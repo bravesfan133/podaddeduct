@@ -126,9 +126,28 @@ document.getElementById('searchBtn').addEventListener('click', search);
 q.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); search(); } });
 document.querySelectorAll('[data-copy]').forEach(el => {
   el.addEventListener('click', async () => {
-    await navigator.clipboard.writeText(el.dataset.copy);
-    el.textContent = 'Copied ✓';
-    setTimeout(() => el.textContent = 'Copy link', 1200);
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(el.dataset.copy);
+      ok = true;
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = el.dataset.copy;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        ok = true;
+      } catch (e2) {
+        ok = false;
+      } finally {
+        ta.remove();
+      }
+    }
+    el.textContent = ok ? 'Copied ✓' : 'Copy failed — long-press the link';
+    setTimeout(() => el.textContent = 'Copy link', 2000);
   });
 });
 </script>

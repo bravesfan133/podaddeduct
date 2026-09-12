@@ -27,8 +27,8 @@ class Settings(BaseSettings):
 
     # Empty = auto-detect LAN IP (do not use 127.0.0.1 for phone clients)
     public_base_url: str = ""
-    process_recent: int = 3
-    feed_item_limit: int = 40
+    process_recent: int = 2
+    feed_item_limit: int = 300
     min_ad_seconds: float = 8.0
     data_dir: Path = Path("./data")
     host: str = "0.0.0.0"

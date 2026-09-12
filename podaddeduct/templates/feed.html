@@ -38,6 +38,9 @@
     <form method="post" action="/shows/{{ feed.slug }}/refresh" style="display:inline">
       <button type="submit" class="ghost">Check for new episodes</button>
     </form>
+    <form method="post" action="/shows/{{ feed.slug }}/prepare" style="display:inline">
+      <button type="submit" class="ghost">Prepare next 5</button>
+    </form>
     <form method="post" action="/shows/{{ feed.slug }}/delete" style="display:inline" onsubmit="return confirm('Remove this show and delete its downloaded files?')">
       <button type="submit" class="danger">Remove show</button>
     </form>
@@ -49,7 +52,7 @@
       <input type="hidden" name="settings_form" value="1" />
       <div class="row">
         <div><label><input type="checkbox" name="auto_download" value="1" {% if feed_settings.auto_download %}checked{% endif %} /> Prepare new episodes automatically</label></div>
-        <div><label>Keep latest</label><input type="number" name="keep_last" min="1" max="50" value="{{ feed_settings.keep_last }}" /></div>
+        <div><label>Keep latest <span class="muted">(empty = global: {{ keep_last_global }})</span></label><input type="number" name="keep_last" min="1" max="50" value="{{ keep_last_raw or '' }}" placeholder="{{ keep_last_global }}" /></div>
         <div><label>Remove ads by</label>
           <select name="mode">
             <option value="cut" {% if feed_settings.mode=='cut' %}selected{% endif %}>Cut them out (recommended)</option>
@@ -62,7 +65,7 @@
   </div>
 
   <table>
-    <thead><tr><th>Episode</th><th>Status</th><th>Saved</th></tr></thead>
+    <thead><tr><th>Episode</th><th>Status</th><th>Saved</th><th></th></tr></thead>
     <tbody>
     {% for r in rows %}
       <tr>
@@ -74,17 +77,40 @@
           {% else %}<span class="pill">New</span>{% endif %}
         </td>
         <td class="muted">{% if r.ads %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
+        <td>{% if r.ep.status in ('pending', 'error') %}<form method="post" action="/episodes/{{ r.ep.id }}/recheck" style="display:inline"><button type="submit" class="ghost" style="margin:0;padding:0.35rem 0.7rem;font-size:0.85rem">Prepare</button></form>{% endif %}</td>
       </tr>
     {% else %}
-      <tr><td colspan="3" class="muted">No episodes yet — press “Check for new episodes”.</td></tr>
+      <tr><td colspan="4" class="muted">No episodes yet — press “Check for new episodes”.</td></tr>
     {% endfor %}
     </tbody>
   </table>
 <script>
+async function copyText(t) {
+  // clipboard API needs a secure context (https/localhost); LAN http falls back.
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      return true;
+    } catch (e2) {
+      return false;
+    } finally {
+      ta.remove();
+    }
+  }
+}
 document.getElementById('copy').addEventListener('click', async (e) => {
-  await navigator.clipboard.writeText(document.getElementById('feedlink').textContent.trim());
-  e.target.textContent = 'Copied ✓';
-  setTimeout(() => e.target.textContent = 'Copy link', 1200);
+  const ok = await copyText(document.getElementById('feedlink').textContent.trim());
+  e.target.textContent = ok ? 'Copied ✓' : 'Copy failed — long-press the link';
+  setTimeout(() => e.target.textContent = 'Copy link', 2000);
 });
 </script>
 </body>

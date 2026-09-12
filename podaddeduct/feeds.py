@@ -109,6 +109,23 @@ def rewrite_feed_xml(
     limit = item_limit if item_limit is not None else db.runtime_int("feed_item_limit", minimum=1, maximum=500)
     entries = list(parsed.entries[: max(1, limit)])
 
+    # Strict feed: only episodes with a clean file on disk appear, so the
+    # player can never fetch audio with ads. The one exception is shows in
+    # chapters mode (explicit user choice): ready episodes serve the
+    # original with chapter marks since no clean file can ever exist.
+    chapters_ok = (db.get_feed_settings(feed).get("mode") == "chapters")
+
+    def _playable(ep: db.Episode | None) -> bool:
+        if ep is None:
+            return False
+        if db.has_clean_audio(ep):
+            return True
+        return bool(
+            chapters_ok
+            and ep.status in {"ready", "manual"}
+            and db.served_audio_path(ep)
+        )
+
     items: list[str] = []
     for entry in entries:
         enclosure = entry_enclosure(entry)
@@ -116,7 +133,10 @@ def rewrite_feed_xml(
             continue
         guid = entry_guid(entry, enclosure)
         ep = episodes_by_guid.get(guid)
-        title = _xml_text(getattr(entry, "title", None) or (ep.title if ep else "Episode"))
+        if not _playable(ep):
+            continue
+        assert ep is not None
+        title = _xml_text(getattr(entry, "title", None) or ep.title or "Episode")
         desc = _xml_text(getattr(entry, "summary", None) or getattr(entry, "description", None) or "")
         pub = entry_pub_date(entry) or ""
         pub_out = pub
@@ -125,10 +145,9 @@ def rewrite_feed_xml(
         except Exception:
             pass
 
-        if ep:
-            enc_url = f"{public_base.rstrip('/')}/audio/{ep.id}"
-        else:
-            enc_url = enclosure
+        # Every listed episode is playable, so the enclosure always points
+        # at our server — upstream bytes are never referenced.
+        enc_url = f"{public_base.rstrip('/')}/audio/{ep.id}"
 
         length = "0"
         mime = "audio/mpeg"
@@ -136,7 +155,7 @@ def rewrite_feed_xml(
             enc0 = entry.enclosures[0]
             length = str(enc0.get("length") or "0")
             mime = str(enc0.get("type") or mime)
-        served = db.served_audio_path(ep) if ep else None
+        served = db.served_audio_path(ep)
         if served:
             try:
                 length = str(served.stat().st_size)
@@ -145,7 +164,7 @@ def rewrite_feed_xml(
 
         duration_tag = ""
         itunes_duration = getattr(entry, "itunes_duration", None)
-        if ep and ep.duration_seconds:
+        if ep.duration_seconds:
             secs = int(ep.duration_seconds)
             duration_tag = f"<itunes:duration>{secs}</itunes:duration>"
         elif itunes_duration:

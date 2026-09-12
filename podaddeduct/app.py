@@ -96,37 +96,66 @@ def _feed_artwork(parsed) -> str:
     return ""
 
 
+# Rendered-feed cache: podcast apps poll aggressively and big upstream
+# feeds are megabytes to parse. 60s TTL per (show, base URL) keeps the N100
+# responsive. In-flight cleaning still progresses; slightly stale lengths
+# self-correct on the next poll.
+_feed_cache: dict[tuple[str, str], tuple[float, bytes]] = {}
+_FEED_TTL = 60.0
+
+
 async def render_feed_response(feed: db.Feed, request: Request) -> Response:
+    import time
+
+    base = public_base(request)
+    cache_key = (feed.slug, base)
+    hit = _feed_cache.get(cache_key)
+    if hit and time.monotonic() - hit[0] < _FEED_TTL:
+        return Response(
+            content=hit[1],
+            media_type="application/rss+xml; charset=utf-8",
+            headers={"Cache-Control": "no-cache"},
+        )
     # Feed refreshes are cheap metadata syncs. Never bulk-queue here —
     # podcast apps refresh often and would flood the worker.
     try:
-        await sync_feed_episodes(feed, queue_recent=False, autodl=True)
+        raw = await fetch_feed_bytes(feed.upstream_url)
+    except Exception as exc:
+        if hit:
+            return Response(
+                content=hit[1],
+                media_type="application/rss+xml; charset=utf-8",
+                headers={"Cache-Control": "no-cache"},
+            )
+        raise HTTPException(502, f"Couldn't reach the publisher's feed: {exc}") from exc
+    try:
+        await sync_feed_episodes(feed, queue_recent=False, autodl=True, raw=raw)
     except Exception:
         logger.exception("Feed sync failed")
     feed = db.get_feed(feed.id) or feed
-    try:
-        raw = await fetch_feed_bytes(feed.upstream_url)
-    except Exception as exc:
-        raise HTTPException(502, f"Couldn't reach the publisher's feed: {exc}") from exc
     parsed = parse_feed(raw, href=feed.upstream_url)
     episodes = {e.guid: e for e in db.list_episodes(feed.id)}
     xml = rewrite_feed_xml(
         parsed,
         feed=feed,
         episodes_by_guid=episodes,
-        public_base=public_base(request),
+        public_base=base,
     )
+    content = xml.encode("utf-8")
+    _feed_cache[cache_key] = (time.monotonic(), content)
     return Response(
-        content=xml,
+        content=content,
         media_type="application/rss+xml; charset=utf-8",
         headers={"Cache-Control": "no-cache"},
     )
 
 
 async def sync_feed_episodes(
-    feed: db.Feed, *, queue_recent: bool = False, autodl: bool = False
+    feed: db.Feed, *, queue_recent: bool = False, autodl: bool = False,
+    queue_count: int | None = None, raw: bytes | None = None,
 ) -> list[db.Episode]:
-    raw = await fetch_feed_bytes(feed.upstream_url)
+    if raw is None:
+        raw = await fetch_feed_bytes(feed.upstream_url)
     parsed = parse_feed(raw, href=feed.upstream_url)
     title = parsed.feed.get("title") or feed.title or feed.slug
     if title != feed.title:
@@ -136,27 +165,29 @@ async def sync_feed_episodes(
     if art and art != (feed.artwork_url or ""):
         db.update_feed_artwork(feed.id, art)
 
-    episodes: list[db.Episode] = []
-    for entry in parsed.entries:
-        enclosure = entry_enclosure(entry)
-        if not enclosure:
-            continue
-        guid = entry_guid(entry, enclosure)
-        ep = db.upsert_episode(
-            feed.id,
-            guid=guid,
-            title=str(getattr(entry, "title", None) or "Episode"),
-            enclosure_url=enclosure,
-            pub_date=entry_pub_date(entry),
-        )
-        episodes.append(ep)
+    episodes = db.upsert_episodes_batch(
+        feed.id,
+        [
+            {
+                "guid": entry_guid(entry, enclosure),
+                "title": str(getattr(entry, "title", None) or "Episode"),
+                "enclosure_url": enclosure,
+                "pub_date": entry_pub_date(entry),
+            }
+            for entry in parsed.entries
+            if (enclosure := entry_enclosure(entry))
+        ],
+    )
 
     fs = db.get_feed_settings(feed)
     auto_on = fs.get("auto_download", True) and db.runtime_bool("auto_prepare_latest")
     should_queue = queue_recent or (autodl and auto_on)
     if should_queue and episodes:
-        # Only the newest unprepared episode — never the whole back-catalog.
-        target = episodes[:1] if autodl and not queue_recent else episodes[: db.runtime_int("process_recent", minimum=1, maximum=20)]
+        # Only the newest unprepared episode(s) — never the whole back-catalog.
+        # Older episodes wait for an explicit Prepare tap (web UI or player).
+        if queue_count is None:
+            queue_count = 1 if (autodl and not queue_recent) else db.runtime_int("process_recent", minimum=1, maximum=20)
+        target = episodes[: max(1, queue_count)]
         for ep in target:
             fresh = db.get_episode(ep.id)
             if not fresh:
@@ -188,8 +219,9 @@ async def get_or_create_feed(upstream_url: str, artwork: str = "") -> db.Feed:
         db.update_feed_artwork(feed.id, art)
         feed = db.get_feed(feed.id) or feed
     # Prepare the latest episode right away so the first play is fast.
+    # Just one: the rest wait for an explicit Prepare tap (disk stays small).
     try:
-        await sync_feed_episodes(feed, queue_recent=True)
+        await sync_feed_episodes(feed, queue_recent=True, queue_count=1)
     except Exception:
         logger.exception("Initial sync failed for %s", upstream_url)
     return feed
@@ -597,6 +629,8 @@ def _show_page(feed: db.Feed, request: Request) -> HTMLResponse:
         {
             "feed": feed,
             "feed_settings": db.get_feed_settings(feed),
+            "keep_last_raw": db.feed_keep_last_raw(feed),
+            "keep_last_global": db.global_keep_last(),
             "episodes": episodes,
             "rows": rows,
             "public_base": public_base(request),
@@ -638,7 +672,10 @@ async def save_show_settings(slug: str, request: Request) -> RedirectResponse:
         updates["auto_download"] = str(form.get("auto_download")).lower() in {"1", "on", "true"}
     elif form.get("settings_form"):
         updates["auto_download"] = False
-    if form.get("keep_last") not in (None, ""):
+    if form.get("keep_last") in (None, ""):
+        # Empty = inherit the global number.
+        updates["keep_last"] = None
+    else:
         try:
             updates["keep_last"] = max(1, min(50, int(str(form.get("keep_last")))))
         except ValueError:
@@ -654,6 +691,33 @@ async def save_show_settings(slug: str, request: Request) -> RedirectResponse:
         except Exception:
             pass
     return RedirectResponse(f"/shows/{slug}?saved=1", status_code=303)
+
+
+@app.post("/shows/{slug}/prepare")
+async def prepare_next(slug: str, request: Request) -> RedirectResponse:
+    """Queue the next few unprepared episodes, newest first (couch taps)."""
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    feed = db.get_feed_by_slug(slug)
+    if not feed:
+        raise HTTPException(404, "Show not found")
+    form = await request.form()
+    try:
+        n = max(1, min(20, int(str(form.get("n") or 5))))
+    except ValueError:
+        n = 5
+    queued = 0
+    for ep in db.list_episodes(feed.id):
+        if queued >= n:
+            break
+        fresh = db.get_episode(ep.id)
+        if not fresh or db.served_audio_path(fresh):
+            continue
+        if fresh.status not in {"pending", "error"}:
+            continue
+        if await enqueue_episode(ep.id):
+            queued += 1
+    return RedirectResponse(f"/shows/{slug}?queued={queued}", status_code=303)
 
 
 @app.post("/shows/{slug}/refresh")
@@ -768,13 +832,15 @@ async def save_ranges(
 
 @app.api_route("/audio/{episode_id}", methods=["GET", "HEAD"])
 async def audio(episode_id: int, request: Request) -> Response:
-    """Serve the cleaned file. Never block a podcast app.
+    """Serve cleaned audio. Strict: unprocessed bytes never leave this server.
 
     - HEAD: report upstream headers only, queue nothing (feed refreshes).
-    - GET with clean file: serve it (206 range support via FileResponse).
-    - GET while working / not started: queue in background and redirect to
-      the publisher's original file so playback starts instantly (with ads
-      this once); the next refresh gets the clean file.
+    - GET with a clean file: serve it (206 range support via FileResponse).
+    - GET with a finished original and nothing to cut (no ads found, or the
+      show is in chapters mode): serve the original.
+    - GET otherwise: queue at the front and answer 503 + Retry-After so the
+      player keeps retrying until the clean file is ready. Never redirects
+      to the publisher's with-ads file.
     """
     ep = db.get_episode(episode_id)
     if not ep:
@@ -795,8 +861,10 @@ async def audio(episode_id: int, request: Request) -> Response:
         except Exception:
             return Response(status_code=200, headers={"content-type": "audio/mpeg"})
 
+    has_clean = bool(ep.clean_audio_path and Path(ep.clean_audio_path).exists())
     served = db.served_audio_path(ep)
-    if served:
+    finished = ep.status in {"ready", "manual"}
+    if served and (has_clean or finished):
         db.touch_served(episode_id)
         try:
             size = served.stat().st_size
@@ -806,9 +874,16 @@ async def audio(episode_id: int, request: Request) -> Response:
             pass
         return FileResponse(served, media_type="audio/mpeg", filename=f"{episode_id}.mp3")
 
-    # Nothing ready: work in background, play original meanwhile.
-    await enqueue_episode(episode_id)
-    return RedirectResponse(ep.enclosure_url, status_code=302)
+    # Not clean yet: jump the queue and tell the player to retry.
+    # It shows "downloading" meanwhile and picks up the clean file
+    # on a later attempt — ads never play.
+    await enqueue_episode(episode_id, priority=True)
+    return Response(
+        status_code=503,
+        headers={"Retry-After": "60", "Cache-Control": "no-store"},
+        content="Episode is being cleaned — retry shortly.",
+        media_type="text/plain",
+    )
 
 
 @app.get("/chapters/{episode_id}.json")

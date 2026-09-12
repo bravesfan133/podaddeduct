@@ -17,17 +17,22 @@ from .stt import transcript_path_for, transcribe_audio
 
 logger = logging.getLogger("podaddeduct.process")
 
-_queue: asyncio.Queue[int] | None = None
+_queue: asyncio.PriorityQueue[tuple[int, int, int]] | None = None
 _worker_started = False
+_seq = 0
 # Dedup: episode ids already queued or being processed. Prevents podcast-app
 # refresh storms from flooding the worker.
 _queued: set[int] = set()
 
+# Priority levels: a tap in the player jumps ahead of background jobs.
+PRIO_TAPPED = 0
+PRIO_BACKGROUND = 1
 
-def get_queue() -> asyncio.Queue[int]:
+
+def get_queue() -> asyncio.PriorityQueue[tuple[int, int, int]]:
     global _queue
     if _queue is None:
-        _queue = asyncio.Queue()
+        _queue = asyncio.PriorityQueue()
     return _queue
 
 
@@ -44,8 +49,12 @@ def queue_depth() -> int:
     return q.qsize() if q else 0
 
 
-async def enqueue_episode(episode_id: int, *, reseed: bool = False) -> bool:
-    """Queue an episode unless already queued/working. Returns True if queued."""
+async def enqueue_episode(episode_id: int, *, reseed: bool = False, priority: bool = False) -> bool:
+    """Queue an episode unless already queued/working. Returns True if queued.
+
+    priority=True puts a player tap ahead of background jobs.
+    """
+    global _seq
     if reseed:
         clear_for_redetect(episode_id, clear_transcript=False)
     else:
@@ -58,14 +67,15 @@ async def enqueue_episode(episode_id: int, *, reseed: bool = False) -> bool:
             return False
     await ensure_worker()
     _queued.add(episode_id)
-    await get_queue().put(episode_id)
+    _seq += 1
+    await get_queue().put((PRIO_TAPPED if priority else PRIO_BACKGROUND, _seq, episode_id))
     return True
 
 
 async def _worker_loop() -> None:
     q = get_queue()
     while True:
-        episode_id = await q.get()
+        _, _, episode_id = await q.get()
         try:
             await process_episode(episode_id)
         except Exception:
@@ -98,13 +108,16 @@ async def process_episode(episode_id: int) -> None:
     ep = db.get_episode(episode_id)
     if not ep:
         return
-    if ep.status == "manual":
+    has_clean = bool(ep.clean_audio_path and Path(ep.clean_audio_path).exists())
+    if ep.status == "manual" and has_clean:
         return
     # Already has a clean file on disk — nothing to do.
-    if db.served_audio_path(ep) and ep.clean_audio_path and Path(ep.clean_audio_path).exists():
+    if db.served_audio_path(ep) and has_clean:
         if ep.status != "ready":
             db.update_episode(episode_id, status="ready", error=None)
         return
+    # Manual marks with evicted files: fall through to re-cut from saved
+    # marks below instead of returning early (would 503 forever).
 
     db.update_episode(episode_id, status="working", error=None)
     audio_path = Path(ep.audio_path) if ep.audio_path else audio_path_for(episode_id)
