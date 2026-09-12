@@ -16,10 +16,10 @@ logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MAX_TRIES = 3
-GEMINI_MAX_OUTPUT_TOKENS = 2048
+GEMINI_MAX_OUTPUT_TOKENS = 8192
 
 # Obvious sponsor-read cues. Contiguous hits become heuristic ad ranges.
 _HEURISTIC_RE = re.compile(
@@ -73,16 +73,36 @@ def _extract_json_array(text: str) -> list[dict]:
     text = (text or "").strip()
     if not text:
         return []
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
+        if m:
+            text = m.group(1).strip()
+        else:
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+    data = None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        m = _JSON_ARRAY_RE.search(text)
-        if not m:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                last_brace = text[:end].rfind("}")
+                if last_brace > start:
+                    data = json.loads(text[start : last_brace + 1] + "]")
+                else:
+                    raise
+        elif start != -1:
+            last_brace = text.rfind("}")
+            if last_brace > start:
+                data = json.loads(text[start : last_brace + 1] + "]")
+            else:
+                raise
+        else:
             raise
-        data = json.loads(m.group(0))
     if not isinstance(data, list):
         raise ValueError("expected JSON array")
     out: list[dict] = []
@@ -91,8 +111,11 @@ def _extract_json_array(text: str) -> list[dict]:
             continue
         if "start" not in item or "end" not in item:
             continue
-        start = float(item["start"])
-        end = float(item["end"])
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (TypeError, ValueError):
+            continue
         if end > start:
             out.append({"start": start, "end": end})
     return out
@@ -130,7 +153,14 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
                         raise RuntimeError("Gemini returned no candidates")
                     content = (candidates[0].get("content") or {})
                     parts = content.get("parts") or []
-                    texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict)]
+                    # Filter out thinking process parts (thought: True) returned by Gemini 3.x Flash
+                    texts = [
+                        str(p.get("text") or "")
+                        for p in parts
+                        if isinstance(p, dict) and not p.get("thought")
+                    ]
+                    if not texts and parts:
+                        texts = [str(parts[-1].get("text") or "")]
                     return "\n".join(t for t in texts if t).strip()
                 last_err = f"{resp.status_code} {resp.text[:300]}"
                 if resp.status_code not in (408, 425, 429, 500, 502, 503, 504):

@@ -55,7 +55,7 @@ def test_global_save_accepts_new_fields(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "min_ad_seconds": "12", "gemini_model": "gemini-2.5-flash",
+            data={"settings_form": "1", "min_ad_seconds": "12", "gemini_model": "gemini-3.6-flash",
                   "public_base_url": "https://podcasts.example.com",
                   "delete_original_after_cut": "on"},
             follow_redirects=False,
@@ -63,7 +63,7 @@ def test_global_save_accepts_new_fields(tmp_path, monkeypatch):
         assert r.status_code == 303
         assert r.headers["location"].startswith("/settings?saved=settings")
     assert db.runtime_float("min_ad_seconds") == 12.0
-    assert db.runtime_str("gemini_model") == "gemini-2.5-flash"
+    assert db.runtime_str("gemini_model") == "gemini-3.6-flash"
     assert db.runtime_bool("delete_original_after_cut") is True
     assert db.runtime_str("public_base_url") == "https://podcasts.example.com"
 

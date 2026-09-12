@@ -83,7 +83,7 @@ def gemini_key_status() -> dict:
         "configured": bool(stored or env),
         "source": source,
         "hint": hint,
-        "model": _db.runtime_str("gemini_model") or "gemini-2.5-flash",
+        "model": _db.runtime_str("gemini_model") or "gemini-3.6-flash",
     }
 
 

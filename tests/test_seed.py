@@ -135,4 +135,4 @@ def test_default_gemini_model():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["gemini_model"].default
-    assert default == "gemini-2.5-flash"
+    assert default == "gemini-3.6-flash"

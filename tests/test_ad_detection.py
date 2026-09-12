@@ -65,12 +65,56 @@ def test_gemini_generate_success(tmp_path, monkeypatch):
     _FakeClient.instances.clear()
     fake = _FakeClient([_ok_gemini('[{"start": 1, "end": 2}]')])
     with patch.object(seed_mod.httpx, "Client", return_value=fake):
-        out = seed_mod._gemini_generate("k", "gemini-2.5-flash", "hi")
+        out = seed_mod._gemini_generate("k", "gemini-3.6-flash", "hi")
     assert out == '[{"start": 1, "end": 2}]'
     url, kwargs = fake.posts[0]
-    assert "gemini-2.5-flash:generateContent" in url
+    assert "gemini-3.6-flash:generateContent" in url
     assert kwargs["headers"]["x-goog-api-key"] == "k"
     assert kwargs["json"]["generationConfig"]["responseMimeType"] == "application/json"
+    assert kwargs["json"]["generationConfig"]["maxOutputTokens"] == 8192
+
+
+def test_gemini_generate_filters_thinking_parts(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    # Gemini 3.x Flash returns thought: True on reasoning part
+    resp = _FakeResp(
+        200,
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": 'Thinking process with unescaped "quotes" and [brackets]', "thought": True},
+                            {"text": '[{"start": 10.5, "end": 45.0}]'},
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    fake = _FakeClient([resp])
+    with patch.object(seed_mod.httpx, "Client", return_value=fake):
+        out = seed_mod._gemini_generate("k", "gemini-3.6-flash", "hi")
+    assert out == '[{"start": 10.5, "end": 45.0}]'
+    assert seed_mod._extract_json_array(out) == [{"start": 10.5, "end": 45.0}]
+
+
+def test_extract_json_array_edge_cases():
+    from podaddeduct import seed as seed_mod
+
+    # Markdown wrapped
+    md = "```json\n[{\"start\": 1.0, \"end\": 2.5}]\n```"
+    assert seed_mod._extract_json_array(md) == [{"start": 1.0, "end": 2.5}]
+
+    # Explanatory text surrounding array
+    surrounded = "Found ads:\n[{\"start\": 5.0, \"end\": 10.0}]\nDone."
+    assert seed_mod._extract_json_array(surrounded) == [{"start": 5.0, "end": 10.0}]
+
+    # Truncated JSON array salvages valid objects
+    truncated = '[{"start": 1.0, "end": 2.0}, {"start": 3.0, "end":'
+    assert seed_mod._extract_json_array(truncated) == [{"start": 1.0, "end": 2.0}]
 
 
 def test_gemini_retries_429_then_succeeds(tmp_path, monkeypatch):
@@ -107,7 +151,7 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    assert seed_mod.gemini_model() == "gemini-2.5-flash"
+    assert seed_mod.gemini_model() == "gemini-3.6-flash"
     db.set_global_settings({"gemini_model": "gemini-2.0-flash"})
     assert seed_mod.gemini_model() == "gemini-2.0-flash"
 
@@ -131,7 +175,7 @@ def test_find_ads_uses_gemini(tmp_path, monkeypatch):
     ):
         ads = seed_mod.find_ads_with_zen(transcript)
     assert len(ads) == 1
-    assert calls and calls[0] == "gemini-2.5-flash"
+    assert calls and calls[0] == "gemini-3.6-flash"
 
 
 def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
@@ -181,8 +225,8 @@ def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "gemini_model": "gemini-2.5-flash"},
+            data={"settings_form": "1", "gemini_model": "gemini-3.6-flash"},
             follow_redirects=False,
         )
         assert r.status_code == 303
-    assert db.runtime_str("gemini_model") == "gemini-2.5-flash"
+    assert db.runtime_str("gemini_model") == "gemini-3.6-flash"
