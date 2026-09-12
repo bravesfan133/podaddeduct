@@ -1,4 +1,4 @@
-# PodAdDeduct — home-server compose file.
+# PodAdDeduct — home-server compose file (Intel N100).
 # On the server: cp .env.example .env && docker compose up -d --build
 services:
   podaddeduct:
@@ -13,11 +13,21 @@ services:
       DATA_DIR: /data
       HOST: 0.0.0.0
       PORT: 7887
-      # Container defaults for Linux transcription (N100-friendly).
-      # The home-page Server settings override these at runtime.
+      # Intel Xe iGPU (Alder Lake-N) — iHD media driver, not i965.
+      LIBVA_DRIVER_NAME: iHD
+      # Cloud STT default (N100 should not run Whisper on CPU).
+      # Settings UI can override at runtime.
       STT_PYTHON: python
-      STT_SIDECAR: ./scripts/stt_faster.py
-      STT_MODEL: base
+      STT_SIDECAR: ./scripts/stt_groq.py
+      STT_MODEL: whisper-large-v3-turbo
+      GEMINI_MODEL: gemini-3.5-flash
+    devices:
+      # Pass N100 iGPU for ffmpeg VAAPI decode when codecs allow.
+      - /dev/dri:/dev/dri
+    group_add:
+      # GIDs must match host `getent group video render` if non-standard.
+      - video
+      - render
     volumes:
       - podaddeduct-data:/data
     restart: unless-stopped

@@ -17,25 +17,27 @@ logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "opencode/nemotron-3-ultra-free"
-GEMINI_FALLBACK_MODEL = "opencode/nemotron-3-ultra-free"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-OPENCODE_DEFAULT_MODEL = "nemotron-3-ultra-free"
-OPENCODE_PROVIDER = "opencode"
-OPENCODE_MESSAGE_TIMEOUT = 300.0
 GEMINI_MAX_TRIES = 5
 GEMINI_MAX_OUTPUT_TOKENS = 8192
 
-# MinusPod-style boundary defaults.
+# Boundary defaults.
 EARLY_AD_SNAP_SECONDS = 30.0
 POSTROLL_CLAMP_SECONDS = 45.0
 AD_PAD_START_SECONDS = 0.3
 AD_PAD_END_SECONDS = 0.6
 NEARBY_AD_GAP_SECONDS = 15.0
-HEURISTIC_MERGE_GAP_SECONDS = 35.0
+HEURISTIC_MERGE_GAP_SECONDS = 8.0
 SILENCE_SNAP_WINDOW_SECONDS = 2.0
 # No real podcast ad is a 4–7s keyword sentence — reject micro-cuts.
 MIN_AD_CUT_SECONDS = 15.0
+# Real ads are short; a 51-minute "ad" is a model miss.
+MAX_AD_CUT_SECONDS = 180.0
+# Refuse to cut when marked ads would wipe most of the episode.
+MAX_AD_COVERAGE = 0.35
+MIN_REMAINING_SECONDS = 600.0
+MIN_CONFIDENCE = 0.6
 
 ALLOWED_AD_TYPES = {"host_read", "inserted_ad", "unknown_ad"}
 
@@ -68,53 +70,32 @@ class AdDetectionResult:
     ranges: list[Interval] = field(default_factory=list)
     gemini_error: str | None = None
     gemini_ok: bool = False
+    sources: list[str] = field(default_factory=list)
 
-# Obvious sponsor-read cues (MinusPod AD_START_PHRASES + sports disclaimers).
+
+@dataclass
+class CutGuardResult:
+    """Whether ads are safe to cut, plus the filtered ranges."""
+
+    ok: bool
+    ranges: list[Interval]
+    reason: str | None = None
+
+
+# Tight sponsor-read cues only (hints / fallback when Gemini fails entirely).
+# Do NOT include bare "go to …com" / "paid for by" — those fire on news talk.
 _HEURISTIC_RE = re.compile(
     r"(?i)\b("
     r"brought to you by|"
     r"this episode is (brought to you|sponsored)|"
     r"sponsored by|"
-    r"presented by|"
-    r"our sponsor|"
     r"today'?s sponsor|"
     r"thanks to our sponsor|"
-    r"thank our sponsor|"
     r"word from our sponsor|"
-    r"a word from|"
-    r"support comes from|"
-    r"supported by|"
-    r"let'?s take a (quick )?break|"
-    r"take a quick break|"
-    r"take a moment|"
-    r"we'?ll be right back|"
-    r"we'?ll be right back after|"
-    r"after (these|this) (messages?|break|word from)|"
-    r"ad break|"
-    r"commercial break|"
-    r"before we get (back )?into|"
-    r"first let me tell you|"
-    r"i want to tell you about|"
-    r"let me tell you about|"
     r"promo code|"
-    r"use (the )?code|"
+    r"use (the )?code [A-Z0-9]{3,}|"
     r"discount code|"
-    r"enter code|"
-    r"at checkout|"
-    r"special offer|"
-    r"visit \w[\w.-]*\.(com|net|org|io)|"
-    r"go to \w[\w.-]*\.(com|net|org|io)|"
-    r"head to \w[\w.-]*\.(com|net|org|io)|"
-    r"support (for )?this (show|podcast) comes from|"
-    r"paid for by|"
-    r"fanduel|"
-    r"draftkings|"
-    r"betmgm|"
-    r"caesars|"
-    r"gambling problem|"
-    r"1[\s-]?800[\s-]?gambler|"
-    r"must be 21|"
-    r"terms and conditions apply"
+    r"enter code [A-Z0-9]{3,}"
     r")\b"
 )
 
@@ -126,176 +107,44 @@ You will receive a timestamped transcript of a podcast episode.
 
 ## What counts as an advertisement
 
-Mark a segment as an advertisement when it is clearly commercial or sponsored, including:
+Mark a segment as an advertisement ONLY when it is a paid commercial break:
 
-* Host-read sponsor advertisements
-* Dynamically inserted advertisements
-* Pre-recorded advertisements
-* Pre-roll, mid-roll, and post-roll ads
-* Sponsor messages
-* Paid endorsements
-* Promo-code or special-URL reads
-* Free-trial offers
-* Discount offers
-* Calls to purchase, subscribe, download, register, sign up, or visit a sponsor
-* Promotional descriptions of a product or service when clearly connected to sponsorship
-* Multiple sponsors presented consecutively during the same commercial break
+* Host-read sponsor advertisements with a pitch AND a call to action (URL, promo code, "shop", "try", "subscribe to the product")
+* Dynamically inserted / pre-recorded advertisements
+* Pre-roll, mid-roll, and post-roll commercial spots
+* Consecutive sponsors in the SAME commercial break (Sponsor A then B then C with no show content between) — return ONE short range covering that break only
 
-Host-read advertisements are especially important. They may sound conversational and may use the same host voice and tone as the rest of the episode.
-
-Common host-read patterns include:
-
-* "This episode is brought to you by..."
-* "Today's sponsor is..."
-* "Thanks to ___ for sponsoring..."
-* "I've been using..."
-* "You guys know I love..."
-* "Go to..."
-* "Use code..."
-* "Get X% off..."
-* "Try it free..."
-* "That's..."
-* "Terms apply."
-* A personal story that transitions into promoting a sponsor
-
-Do not require these exact phrases. Determine whether the content is commercial from its meaning and context.
+A host-read must look like a read: brand/product + CTA. Typical length is 30 seconds to 3 minutes.
 
 ## What does NOT count as an advertisement
 
-Do NOT mark ordinary podcast conversation as advertising merely because a brand, product, company, website, book, movie, service, or person is mentioned.
-
 Do NOT mark:
 
-* Normal discussion of products or companies
-* Unpaid recommendations
-* News or commentary about a company
-* Products relevant to the podcast topic
-* Casual mentions of something the host uses
-* Listener questions involving products
-* Podcast housekeeping
-* Episode introductions
-* Normal calls to follow or subscribe to the podcast itself
-* Requests to rate or review the podcast
+* News, politics, or commentary ABOUT advertisements, campaigns, or companies
+* Ordinary discussion of products, brands, websites, books, or people
+* Unpaid recommendations or casual mentions
+* Podcast housekeeping, intros, outros, "subscribe to this show"
+* Mentions of "paid for by", campaign ads, or political advertising in a news story
+* Long stretches of show content after a midroll — NEVER extend an ad through the rest of the episode
 
-Only classify these as advertisements when there is clear evidence that the segment is sponsored or commercially promotional.
+## Critical length rules
 
-## Podcast self-promotion
-
-Do not normally classify promotion of the current podcast itself as an advertisement.
-
-Examples that are NOT ads:
-
-* "Subscribe to the show."
-* "Leave us a review."
-* "Follow us on Instagram."
-* "Check out last week's episode."
-
-However, promotion for another commercial product, paid subscription, event, network service, course, merchandise, or separate show MAY be advertising if it functions as a commercial break.
-
-## Detecting inserted ads
-
-Inserted advertisements may be obvious because:
-
-* The speaker changes
-* Audio/transcription style changes suddenly
-* The topic changes abruptly
-* A commercial message appears without a host introduction
-* Several unrelated commercial messages appear consecutively
-* Normal podcast conversation resumes abruptly afterward
-
-Treat these as advertisements even if the transcript does not explicitly contain the word "sponsor."
+* Each ad range should be SHORT: typically 30 seconds to 3 minutes.
+* NEVER return a range longer than about 3 minutes unless it is clearly one continuous commercial break of that length.
+* NEVER mark from a midroll to the end of the episode.
+* NEVER merge unrelated ad breaks across normal show content into one range.
+* If several sponsors play back-to-back with no podcast content between them, one continuous short break is fine.
+* If normal conversation resumes, that break ENDS. Later ads are separate ranges.
 
 ## Determining ad boundaries
 
-Boundary accuracy is important.
+Use surrounding context. START is the earliest transcript timestamp that belongs to the commercial. END is the last timestamp that belongs to it — before normal conversation resumes.
 
-Use surrounding context before and after the advertisement to determine where normal podcast content ends and resumes.
-
-The START timestamp should be the earliest supplied timestamp that belongs to the commercial break.
-
-Include a host's transition into the advertisement when the transition is clearly part of the sponsor message.
-
-Example:
-
-Normal discussion
-→ "Before we continue, I want to tell you about..."
-→ sponsor message
-
-The advertisement begins at "Before we continue..."
-
-The END timestamp should be the final supplied timestamp belonging to the advertisement.
-
-Do not include normal conversation after the commercial has finished.
-
-Example:
-
-"...visit example.com and use code SHOW for 20% off."
-→ "Okay, back to what we were talking about..."
-
-The advertisement ends before "Okay, back to what we were talking about."
-
-## Multiple advertisements
-
-If several advertisements occur consecutively with no meaningful podcast content between them, treat the entire sequence as ONE advertisement break.
-
-Example:
-
-Sponsor A
-→ Sponsor B
-→ Sponsor C
-→ podcast resumes
-
-Return one continuous ad range covering all three.
-
-If normal podcast conversation occurs between sponsors, return separate ad ranges.
-
-## Timestamp rules
-
-You MUST use timestamps provided in the transcript.
-
-Never invent timestamps.
-
-Never estimate timestamps based on word count or speaking speed.
-
-If the exact transition occurs between two supplied timestamps, use the closest supplied transcript timestamp that correctly contains the beginning or end of the advertisement.
-
-Do not extend an advertisement simply because you are uncertain.
-
-## Ambiguous segments
-
-Use the complete surrounding context when deciding whether something is an advertisement.
-
-Host-read advertisements can intentionally sound like normal conversation.
-
-Look for combinations of evidence such as:
-
-* Sponsor acknowledgement
-* Product benefits
-* Personal testimonial
-* Promotional language
-* Discount
-* Promo code
-* Special URL
-* Price
-* Trial offer
-* Purchase instructions
-* Call to action
-
-A conversational tone alone is NOT evidence that something is normal podcast content.
-
-When uncertain, assign a lower confidence rather than inventing certainty.
+You MUST use timestamps provided in the transcript. Never invent timestamps.
 
 ## Output
 
-Return ONLY valid JSON.
-
-Do not return Markdown.
-
-Do not explain your answer.
-
-Do not include text before or after the JSON.
-
-Use exactly this structure:
+Return ONLY valid JSON (no Markdown, no explanation):
 
 {
 "ads": [
@@ -309,32 +158,11 @@ Use exactly this structure:
 ]
 }
 
-Allowed `type` values:
+Allowed type values: host_read, inserted_ad, unknown_ad.
+If no advertisements: {"ads": []}.
+Confidence 0.0–1.0. Prefer omitting uncertain segments (confidence would be below 0.6).
 
-* `host_read`
-* `inserted_ad`
-* `unknown_ad`
-
-If the sponsor cannot be determined:
-
-"sponsor": "unknown"
-
-Confidence must be a number between 0.0 and 1.0.
-
-If no advertisements are present, return:
-
-{
-"ads": []
-}
-
-Before producing the JSON, silently verify that:
-
-1. Every detected segment is genuinely commercial.
-2. Host-read ads have not been missed because they sound conversational.
-3. Ordinary product discussion has not been incorrectly classified as advertising.
-4. Each start and end timestamp exists in the supplied transcript.
-5. Consecutive ads have been combined appropriately.
-6. Normal podcast content is excluded from the detected ranges."""
+Silently verify: every range is a real commercial; news about ads is excluded; no range covers most of the episode; timestamps exist in the transcript."""
 
 
 def resolve_gemini_api_key() -> str | None:
@@ -488,8 +316,7 @@ def _extract_json_array(text: str) -> list[dict]:
 def _gemini_generation_config(model: str) -> dict:
     """Build generationConfig: JSON schema + no thinking tokens on Gemini 3.x."""
     cfg: dict = {
-        # Gemini 3.x docs recommend leaving temperature at default (1.0).
-        "temperature": 1.0,
+        "temperature": 0.2,
         "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
         "responseMimeType": "application/json",
         "responseSchema": GEMINI_RESPONSE_SCHEMA,
@@ -560,175 +387,38 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
     raise RuntimeError(f"Gemini failed after {GEMINI_MAX_TRIES} tries: {last_err}")
 
 
-def split_opencode_model(model: str | None) -> tuple[str, str]:
-    raw = (model or "").strip() or f"{OPENCODE_PROVIDER}/{OPENCODE_DEFAULT_MODEL}"
-    if raw.startswith("opencode/"):
-        raw = raw.split("/", 1)[1].strip() or OPENCODE_DEFAULT_MODEL
-    if "/" in raw and not raw.startswith("gemini"):
-        provider, model_id = raw.split("/", 1)
-        return provider.strip() or OPENCODE_PROVIDER, model_id.strip() or OPENCODE_DEFAULT_MODEL
-    return OPENCODE_PROVIDER, raw or OPENCODE_DEFAULT_MODEL
-
-
-def _session_id(data) -> str:
-    if isinstance(data, dict):
-        sid = data.get("id") or (data.get("info") or {}).get("id")
-        if sid:
-            return str(sid)
-    raise RuntimeError(f"OpenCode serve did not return a session id: {data!r}"[:240])
-
-
-def _assistant_error(payload: dict) -> str | None:
-    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-    err = info.get("error")
-    if not err:
-        return None
-    if isinstance(err, dict):
-        data = err.get("data") if isinstance(err.get("data"), dict) else {}
-        msg = data.get("message") or err.get("name") or str(err)
-        return str(msg)
-    return str(err)
-
-
-def _text_from_message(payload) -> str:
-    if not isinstance(payload, dict):
-        raise RuntimeError("OpenCode serve returned a non-object message")
-    err = _assistant_error(payload)
-    if err:
-        raise RuntimeError(f"OpenCode API error: {err}")
-    parts = payload.get("parts")
-    if not isinstance(parts, list):
-        raise RuntimeError("OpenCode serve message has no parts")
-    texts = [
-        str(p.get("text") or "")
-        for p in parts
-        if isinstance(p, dict) and p.get("type") == "text"
-    ]
-    out = "\n".join(t for t in texts if t).strip()
-    if not out:
-        raise RuntimeError("OpenCode serve returned no text parts")
-    return out
-
-
-def opencode_generate(user_content: str, model: str | None = None, *, system: str | None = None) -> str:
-    """Talk to local `opencode serve`. Never runs `opencode run` or calls zen/v1."""
-    from .opencode_server import ensure_opencode_serve, opencode_server_url
-
-    health = ensure_opencode_serve()
-    if not health.get("ok"):
-        raise RuntimeError(
-            health.get("error")
-            or "OpenCode server is not running. podaddeduct starts `opencode serve` automatically if the CLI is installed."
-        )
-    base = opencode_server_url()
-    provider_id, model_id = split_opencode_model(model)
-    session_id = None
-    with httpx.Client(timeout=OPENCODE_MESSAGE_TIMEOUT) as client:
-        created = client.post(f"{base}/session", json={"title": "podaddeduct ads"})
-        if created.status_code >= 400:
-            raise RuntimeError(f"OpenCode session create failed: {created.status_code} {created.text[:200]}")
-        session_id = _session_id(created.json())
-        try:
-            body = {
-                "model": {"providerID": provider_id, "modelID": model_id},
-                "system": system or SYSTEM_PROMPT,
-                "tools": {"bash": False, "edit": False, "write": False, "read": False},
-                "parts": [{"type": "text", "text": user_content}],
-            }
-            resp = client.post(f"{base}/session/{session_id}/message", json=body)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"OpenCode API error: {resp.status_code} {resp.text[:300]}")
-            return _text_from_message(resp.json())
-        finally:
-            if session_id:
-                try:
-                    client.delete(f"{base}/session/{session_id}")
-                except Exception:
-                    pass
-    raise RuntimeError("OpenCode serve returned no content")
-
-
-def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDetectionResult:
-    """Run ad detection via opencode serve on the full transcript."""
-    body = format_timestamped_transcript(transcript)
-    if not body.strip():
-        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
-
-    try:
-        raw = opencode_generate(body, model=model, system=SYSTEM_PROMPT)
-        parsed = _extract_ads_payload(raw)
-        logger.info("opencode serve ad detection -> %d ranges", len(parsed))
-        ranges = merge_intervals(
-            [Interval(float(r["start"]), float(r["end"])) for r in parsed],
-            gap=NEARBY_AD_GAP_SECONDS,
-        )
-        return AdDetectionResult(ranges=ranges, gemini_error=None, gemini_ok=True)
-    except Exception as exc:
-        logger.warning("opencode ad detection failed: %s", exc)
-        return AdDetectionResult(ranges=[], gemini_error=str(exc)[-300:], gemini_ok=False)
-
-
 def test_gemini_connection(model: str | None = None) -> dict:
-    """Prove the configured ad detector works. OpenCode serve unless model is gemini-*."""
+    """Prove Gemini ad detection works with the configured key/model."""
     use_model = (model or "").strip() or gemini_model()
+    if not is_gemini_model(use_model):
+        use_model = GEMINI_DEFAULT_MODEL
     try:
-        if is_gemini_model(use_model):
-            api_key = resolve_gemini_api_key()
-            if not api_key:
-                return {
-                    "ok": False,
-                    "provider": "gemini",
-                    "model": use_model,
-                    "error": "No Gemini API key. OpenCode serve is the default detector — a gemini-* model is the only thing that uses this key.",
-                }
-            start = time.monotonic()
-            raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
-            parsed = _extract_ads_payload(raw)
-            ms = int((time.monotonic() - start) * 1000)
-            return {
-                "ok": True,
-                "provider": "gemini",
-                "model": use_model,
-                "ms": ms,
-                "ranges": len(parsed),
-            }
-        from .opencode_server import serve_health
-
-        health = serve_health()
-        if not health.get("ok"):
-            from .opencode_server import ensure_opencode_serve
-
-            health = ensure_opencode_serve()
-        if not health.get("ok"):
+        api_key = resolve_gemini_api_key()
+        if not api_key:
             return {
                 "ok": False,
-                "provider": "opencode",
+                "provider": "gemini",
                 "model": use_model,
-                "error": health.get("error") or "OpenCode server is not running.",
+                "error": "No Gemini API key. Paste one in Settings → Ad detection.",
             }
         start = time.monotonic()
-        raw = opencode_generate(
-            "[00:00:00 - 00:00:04] Welcome to the show.",
-            model=use_model,
-            system=SYSTEM_PROMPT,
-        )
+        raw = _gemini_generate(api_key, use_model, 'Return exactly: {"ads": []}')
         parsed = _extract_ads_payload(raw)
         ms = int((time.monotonic() - start) * 1000)
-        provider_id, model_id = split_opencode_model(use_model)
         return {
             "ok": True,
-            "provider": "opencode",
-            "model": f"{provider_id}/{model_id}",
+            "provider": "gemini",
+            "model": use_model,
             "ms": ms,
             "ranges": len(parsed),
         }
     except Exception as exc:
         logger.warning("Ad-detection test failed: %s", exc)
-        return {"ok": False, "model": use_model, "error": str(exc)[-300:]}
+        return {"ok": False, "provider": "gemini", "model": use_model, "error": str(exc)[-300:]}
 
 
 def heuristic_ads(transcript: dict) -> list[Interval]:
-    """Mark obvious sponsor-read sentences from the transcript (no LLM)."""
+    """Mark obvious sponsor-read sentences (tight cues only; no LLM)."""
     sentences = transcript.get("sentences") or []
     if not isinstance(sentences, list):
         return []
@@ -745,7 +435,8 @@ def heuristic_ads(transcript: dict) -> list[Interval]:
         except (KeyError, TypeError, ValueError):
             continue
         if end > start:
-            hits.append(Interval(start, end))
+            # Pad slightly but do NOT merge across long gaps into mega-ranges.
+            hits.append(Interval(max(0.0, start - 1.0), end + 2.0))
     return merge_intervals(hits, gap=HEURISTIC_MERGE_GAP_SECONDS)
 
 
@@ -761,7 +452,7 @@ def _sentence_overlaps(start: float, end: float, covered: list[Interval]) -> boo
 
 
 def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
-    """Transcript with sentences already covered by heuristic/publisher ads removed."""
+    """Transcript with sentences already covered by ads removed."""
     sentences = transcript.get("sentences") or []
     if not covered or not isinstance(sentences, list):
         return transcript
@@ -782,35 +473,126 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
     return out
 
 
-def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """One-shot AI ad detection via OpenCode serve (default) or Gemini."""
-    model = gemini_model()
+def snap_to_transcript_times(ranges: list[Interval], transcript: dict) -> list[Interval]:
+    """Snap start/end to nearest sentence boundaries from the transcript."""
+    sentences = transcript.get("sentences") or []
+    if not ranges or not isinstance(sentences, list):
+        return ranges
+    edges: list[float] = []
+    for s in sentences:
+        if not isinstance(s, dict):
+            continue
+        try:
+            edges.append(float(s["start"]))
+            edges.append(float(s["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not edges:
+        return ranges
+    edges = sorted(set(edges))
 
+    def nearest(t: float) -> float:
+        return min(edges, key=lambda e: abs(e - t))
+
+    out: list[Interval] = []
+    for r in ranges:
+        start = nearest(r.start)
+        end = nearest(r.end)
+        if end <= start:
+            # Keep original if snap collapsed the range.
+            start, end = r.start, r.end
+        if end > start:
+            out.append(Interval(start, end))
+    return out
+
+
+def filter_max_duration(
+    ranges: list[Interval],
+    *,
+    duration: float = 0.0,
+    max_seconds: float = MAX_AD_CUT_SECONDS,
+) -> list[Interval]:
+    """Drop or clip ranges that are impossibly long for a real ad break.
+
+    Preroll (starts at 0) and postroll (ends at duration) may be slightly longer
+    but still capped. A 51-minute midroll is always dropped.
+    """
+    out: list[Interval] = []
+    for r in ranges:
+        if r.duration <= max_seconds:
+            out.append(r)
+            continue
+        is_preroll = r.start <= 1.0
+        is_postroll = duration > 0 and r.end >= duration - 1.0
+        if is_preroll:
+            out.append(Interval(r.start, min(r.end, r.start + max_seconds)))
+        elif is_postroll:
+            out.append(Interval(max(r.start, r.end - max_seconds), r.end))
+        else:
+            logger.warning(
+                "dropping oversized ad range %.1f–%.1f (%.0fs > max %.0fs)",
+                r.start,
+                r.end,
+                r.duration,
+                max_seconds,
+            )
+    return out
+
+
+def evaluate_cut_guards(
+    ranges: list[Interval],
+    duration: float,
+    *,
+    max_coverage: float = MAX_AD_COVERAGE,
+    min_remaining: float = MIN_REMAINING_SECONDS,
+) -> CutGuardResult:
+    """Refuse to cut when ads would wipe most of the episode."""
+    if duration <= 0 or not ranges:
+        return CutGuardResult(ok=True, ranges=ranges)
+    ad_time = sum(r.duration for r in ranges)
+    remaining = duration - ad_time
+    coverage = ad_time / duration
+    if coverage > max_coverage and remaining < min_remaining:
+        return CutGuardResult(
+            ok=False,
+            ranges=ranges,
+            reason=(
+                f"Ad detection marked {coverage:.0%} of this episode "
+                f"({ad_time / 60:.0f} min of ads in a {duration / 60:.0f} min show). "
+                "Original kept — not cutting. Re-check or fix marks by hand."
+            ),
+        )
+    if remaining < 60.0 and duration >= 300.0:
+        return CutGuardResult(
+            ok=False,
+            ranges=ranges,
+            reason=(
+                f"Ad detection would leave only {remaining:.0f}s of a "
+                f"{duration / 60:.0f} min episode. Original kept — not cutting."
+            ),
+        )
+    return CutGuardResult(ok=True, ranges=ranges)
+
+
+def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
+    """One-shot Gemini ad detection on the full transcript (exactly one API call)."""
+    model = gemini_model()
     if not is_gemini_model(model):
-        if progress_cb is not None:
-            progress_cb(0, 1)
-        res = find_ads_with_opencode(transcript, model=model)
-        if progress_cb is not None:
-            progress_cb(1, 1)
-        return res
+        model = GEMINI_DEFAULT_MODEL
 
     api_key = resolve_gemini_api_key()
     if not api_key:
-        if progress_cb is not None:
-            progress_cb(0, 1)
-        res = find_ads_with_opencode(transcript)
-        if progress_cb is not None:
-            progress_cb(1, 1)
-        return res
+        return AdDetectionResult(
+            ranges=[],
+            gemini_error="No Gemini API key. Paste one in Settings → Ad detection.",
+            gemini_ok=False,
+        )
 
     body = format_timestamped_transcript(transcript)
     if not body.strip():
-        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
+        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True, sources=["gemini"])
 
     user = "TIMESTAMPED TRANSCRIPT:\n\n" + body
-    last_err: str | None = None
-    parsed: list[dict] = []
-
     if progress_cb is not None:
         progress_cb(0, 1)
 
@@ -819,41 +601,53 @@ def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResul
         parsed = _extract_ads_payload(raw)
         logger.info("gemini %s -> %d ranges", model, len(parsed))
     except Exception as primary_exc:
-        err_text = str(primary_exc)
-        last_err = err_text[-300:]
+        last_err = str(primary_exc)[-300:]
         logger.warning("Gemini ad detection failed: %s", primary_exc)
-        logger.warning("Gemini failed (%s); attempting OpenCode serve backup", last_err)
-        opencode_res = find_ads_with_opencode(transcript)
-        if opencode_res.gemini_ok:
-            if progress_cb is not None:
-                progress_cb(1, 1)
-            return opencode_res
+        if progress_cb is not None:
+            progress_cb(1, 1)
+        return AdDetectionResult(ranges=[], gemini_error=last_err, gemini_ok=False)
 
     if progress_cb is not None:
         progress_cb(1, 1)
 
-    if last_err and not parsed:
-        return AdDetectionResult(ranges=[], gemini_error=last_err, gemini_ok=False)
-
+    # Drop low-confidence hits when the model provided confidence.
+    kept = [r for r in parsed if float(r.get("confidence") or 1.0) >= MIN_CONFIDENCE]
     ranges = merge_intervals(
-        [Interval(float(r["start"]), float(r["end"])) for r in parsed],
+        [Interval(float(r["start"]), float(r["end"])) for r in kept],
         gap=NEARBY_AD_GAP_SECONDS,
     )
-    return AdDetectionResult(ranges=ranges, gemini_error=last_err, gemini_ok=True)
+    ranges = snap_to_transcript_times(ranges, transcript)
+    return AdDetectionResult(
+        ranges=ranges,
+        gemini_error=None,
+        gemini_ok=True,
+        sources=["gemini"],
+    )
 
 
 def find_ads_with_zen(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """Heuristics + Gemini on full transcript (MinusPod-style). Name kept for call sites."""
-    heur = heuristic_ads(transcript)
+    """Gemini on full transcript (one request). Name kept for call sites.
+
+    Does NOT union with heuristic mega-ranges — that wiped news shows.
+    Heuristics are only a last-resort fallback when Gemini fails entirely.
+    """
     llm = find_ads_with_gemini(transcript, progress_cb=progress_cb)
-    # When Gemini failed entirely, do not keep isolated heuristic micro-cuts —
-    # they look like "ads removed" while leaving real ad breaks intact.
-    merged = union_ranges(heur, llm.ranges)
-    merged = filter_min_duration(merged, min_seconds=MIN_AD_CUT_SECONDS)
+    if llm.gemini_ok:
+        ranges = filter_min_duration(llm.ranges, min_seconds=MIN_AD_CUT_SECONDS)
+        return AdDetectionResult(
+            ranges=ranges,
+            gemini_error=llm.gemini_error,
+            gemini_ok=True,
+            sources=llm.sources or ["gemini"],
+        )
+    # Gemini failed — keep tight heuristic hits only (already short gaps).
+    heur = heuristic_ads(transcript)
+    heur = filter_min_duration(heur, min_seconds=MIN_AD_CUT_SECONDS)
     return AdDetectionResult(
-        ranges=merged,
+        ranges=heur,
         gemini_error=llm.gemini_error,
-        gemini_ok=llm.gemini_ok,
+        gemini_ok=False,
+        sources=["heuristic"] if heur else [],
     )
 
 
@@ -894,11 +688,14 @@ def snap_to_silence(
     window: float = SILENCE_SNAP_WINDOW_SECONDS,
     hop_ms: float = 20.0,
 ) -> list[Interval]:
-    """Snap each range edge to a nearby RMS valley so skips aren't mid-word."""
+    """Snap each range edge to a nearby RMS valley so skips aren't mid-word.
+
+    Expects `pcm` to be the FULL episode only when already loaded. Prefer
+    `snap_edges_windowed` which decodes only ±window around each edge.
+    """
     if not ranges or len(pcm) == 0 or sr <= 0:
         return ranges
     duration = len(pcm) / float(sr)
-    # Pad / clamp first so silence snapping searches around the true ad edges.
     ranges = pad_and_clamp_ads(ranges, duration)
     if window <= 0:
         return ranges
@@ -907,9 +704,10 @@ def snap_to_silence(
     n = 1 + max(0, (len(pcm) - frame) // hop)
     if n <= 1:
         return ranges
+    # Vectorized RMS over frames (still one full pass — use snap_edges_windowed to avoid).
+    starts = np.arange(n) * hop
     rms = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        start = i * hop
+    for i, start in enumerate(starts):
         chunk = pcm[start : start + frame]
         rms[i] = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
     times = (np.arange(n) * hop + frame / 2) / float(sr)
@@ -922,34 +720,87 @@ def snap_to_silence(
             return t
         idx = np.where(mask)[0]
         local = rms[idx]
-        # Prefer valleys before the start / after the end so we don't cut mid-word.
         if prefer == "before":
             before = idx[times[idx] <= t]
             if len(before):
-                local_b = rms[before]
-                return float(times[before[int(np.argmin(local_b))]])
+                return float(times[before[int(np.argmin(rms[before]))]])
         elif prefer == "after":
             after = idx[times[idx] >= t]
             if len(after):
-                local_a = rms[after]
-                return float(times[after[int(np.argmin(local_a))]])
-        best_local = int(np.argmin(local))
-        return float(times[idx[best_local]])
+                return float(times[after[int(np.argmin(rms[after]))]])
+        return float(times[idx[int(np.argmin(local))]])
 
     snapped: list[Interval] = []
-
     for r in ranges:
         start = nearest_valley(r.start, "before")
         end = nearest_valley(r.end, "after")
-        # Re-apply early/post-roll clamps after silence snap so valleys don't undo them.
         if r.start == 0.0:
             start = 0.0
         if r.end >= duration - 0.05:
             end = duration
         start = max(0.0, min(start, duration))
         end = max(0.0, min(end, duration))
-        # Keep any non-empty snap; MIN_AD_CUT_SECONDS is enforced later by
-        # filter_min_duration so short fixtures / mid-snap shrinkage still work.
+        if end - start >= 1.0:
+            snapped.append(Interval(start, end))
+    return merge_intervals(snapped, gap=NEARBY_AD_GAP_SECONDS)
+
+
+def snap_edges_windowed(
+    ranges: list[Interval],
+    audio_path,
+    duration: float,
+    *,
+    window: float = SILENCE_SNAP_WINDOW_SECONDS,
+    sr: int = 11025,
+) -> list[Interval]:
+    """Snap ad edges using only ±window audio snippets (no full-file PCM)."""
+    if not ranges or duration <= 0:
+        return ranges
+    ranges = pad_and_clamp_ads(ranges, duration)
+    if window <= 0:
+        return ranges
+    from .decode import load_pcm_window
+
+    def valley_near(t: float, prefer: str) -> float:
+        lo = max(0.0, t - window)
+        hi = min(duration, t + window)
+        if hi - lo < 0.05:
+            return t
+        try:
+            pcm, actual_sr = load_pcm_window(audio_path, lo, hi, target_sr=sr)
+        except Exception as exc:
+            logger.warning("windowed snap decode failed at %.1f: %s", t, exc)
+            return t
+        if len(pcm) == 0 or actual_sr <= 0:
+            return t
+        hop = max(1, int(actual_sr * 0.02))
+        frame = max(hop, int(actual_sr * 0.04))
+        n = 1 + max(0, (len(pcm) - frame) // hop)
+        if n <= 1:
+            return t
+        rms = np.empty(n, dtype=np.float32)
+        for i in range(n):
+            chunk = pcm[i * hop : i * hop + frame]
+            rms[i] = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+        times = lo + (np.arange(n) * hop + frame / 2) / float(actual_sr)
+        if prefer == "before":
+            mask = times <= t
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                return float(times[idx[int(np.argmin(rms[idx]))]])
+        elif prefer == "after":
+            mask = times >= t
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                return float(times[idx[int(np.argmin(rms[idx]))]])
+        return float(times[int(np.argmin(rms))])
+
+    snapped: list[Interval] = []
+    for r in ranges:
+        start = 0.0 if r.start == 0.0 else valley_near(r.start, "before")
+        end = duration if r.end >= duration - 0.05 else valley_near(r.end, "after")
+        start = max(0.0, min(start, duration))
+        end = max(0.0, min(end, duration))
         if end - start >= 1.0:
             snapped.append(Interval(start, end))
     return merge_intervals(snapped, gap=NEARBY_AD_GAP_SECONDS)

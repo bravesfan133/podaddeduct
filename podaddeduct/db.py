@@ -151,82 +151,37 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ts = pub_ts_for(row["pub_date"])
         if ts > 0:
             conn.execute("UPDATE episodes SET pub_ts = ? WHERE id = ?", (ts, row["id"]))
-    _migrate_opencode_detector(conn)
-    _migrate_opencode_http_model(conn)
-    _migrate_nemotron_free_model(conn)
+    _migrate_gemini_detector(conn)
 
 
-def _migrate_opencode_http_model(conn: sqlite3.Connection) -> None:
-    """Map leftover CLI / free-tier model IDs to opencode/nemotron-3-ultra-free."""
+def _migrate_gemini_detector(conn: sqlite3.Connection) -> None:
+    """Map leftover OpenCode / Zen model IDs to gemini-3.5-flash."""
     flag = conn.execute(
-        "SELECT value FROM kv WHERE key = ?", ("_migrated_opencode_http",)
+        "SELECT value FROM kv WHERE key = ?", ("_migrated_gemini_detector_v2",)
     ).fetchone()
     if flag:
         return
     row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
     val = ((row["value"] if row else "") or "").strip()
-    if val.startswith("opencode/"):
-        stripped = val.split("/", 1)[1].strip()
-        conn.execute(
-            "UPDATE kv SET value = ? WHERE key = ?",
-            (stripped or "opencode/nemotron-3-ultra-free", "gemini_model"),
-        )
-    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
-    val = ((row["value"] if row else "") or "").strip()
-    if val in {"deepseek-v4-flash-free", "opencode/deepseek-v4-flash-free"}:
-        conn.execute(
-            "UPDATE kv SET value = ? WHERE key = ?",
-            ("opencode/nemotron-3-ultra-free", "gemini_model"),
-        )
-    conn.execute(
-        "INSERT INTO kv (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        ("_migrated_opencode_http", "1"),
+    legacy = (
+        not val
+        or val.startswith("opencode/")
+        or "nemotron" in val.lower()
+        or "deepseek" in val.lower()
+        or val in {"gemini-2.0-flash", "gemini-2.5-flash"}
     )
-
-
-def _migrate_nemotron_free_model(conn: sqlite3.Connection) -> None:
-    """Paid DeepSeek Flash leftovers become the free Nemotron default."""
-    flag = conn.execute(
-        "SELECT value FROM kv WHERE key = ?", ("_migrated_nemotron_free",)
-    ).fetchone()
-    if flag:
-        return
-    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
-    val = ((row["value"] if row else "") or "").strip()
-    flash = {
-        "deepseek-v4-flash",
-        "opencode/deepseek-v4-flash",
-        "deepseek-v4-flash-free",
-        "opencode/deepseek-v4-flash-free",
-    }
-    if val in flash:
+    if legacy:
         conn.execute(
-            "UPDATE kv SET value = ? WHERE key = ?",
-            ("opencode/nemotron-3-ultra-free", "gemini_model"),
+            "INSERT INTO kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("gemini_model", "gemini-3.5-flash"),
         )
+    for dead in ("opencode_server_url", "opencode_fallback"):
+        conn.execute("DELETE FROM kv WHERE key = ?", (dead,))
     conn.execute(
         "INSERT INTO kv (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        ("_migrated_nemotron_free", "1"),
-    )
-
-
-def _migrate_opencode_detector(conn: sqlite3.Connection) -> None:
-    """Drop leftover Gemini Flash defaults so OpenCode is the detector."""
-    flag = conn.execute(
-        "SELECT value FROM kv WHERE key = ?", ("_migrated_opencode_detector",)
-    ).fetchone()
-    if flag:
-        return
-    row = conn.execute("SELECT value FROM kv WHERE key = ?", ("gemini_model",)).fetchone()
-    val = ((row["value"] if row else "") or "").strip().lower()
-    if val.startswith("gemini"):
-        conn.execute("DELETE FROM kv WHERE key = ?", ("gemini_model",))
-    conn.execute(
-        "INSERT INTO kv (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        ("_migrated_opencode_detector", "1"),
+        ("_migrated_gemini_detector_v2", "1"),
     )
 
 
@@ -379,6 +334,42 @@ def list_episodes(feed_id: int) -> list[Episode]:
             (feed_id,),
         ).fetchall()
     return [_episode_from_row(r) for r in rows]
+
+
+def count_episodes(feed_id: int, *, status_filter: str | None = None) -> int:
+    """Count episodes for a show. status_filter: ready | pending | all/None."""
+    where, args = _episode_filter_sql(feed_id, status_filter)
+    with connect() as conn:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM episodes WHERE {where}", args).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def list_episodes_page(
+    feed_id: int,
+    *,
+    offset: int = 0,
+    limit: int = 50,
+    status_filter: str | None = None,
+) -> list[Episode]:
+    """Paginated newest-first episode list for the show page."""
+    where, args = _episode_filter_sql(feed_id, status_filter)
+    limit = max(1, min(200, int(limit)))
+    offset = max(0, int(offset))
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM episodes WHERE {where} ORDER BY pub_ts DESC, id ASC LIMIT ? OFFSET ?",
+            (*args, limit, offset),
+        ).fetchall()
+    return [_episode_from_row(r) for r in rows]
+
+
+def _episode_filter_sql(feed_id: int, status_filter: str | None) -> tuple[str, tuple]:
+    filt = (status_filter or "all").strip().lower()
+    if filt == "ready":
+        return "feed_id = ? AND status IN ('ready', 'manual')", (feed_id,)
+    if filt == "pending":
+        return "feed_id = ? AND status NOT IN ('ready', 'manual')", (feed_id,)
+    return "feed_id = ?", (feed_id,)
 
 
 def list_ready_episodes(feed_id: int) -> list[Episode]:
@@ -714,10 +705,8 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (OpenCode serve; gemini-* is an optional override)
+    # Ad detection (Gemini)
     "gemini_model": "",
-    "opencode_server_url": "",
-    "opencode_fallback": "",
     # Transcription backend
     "stt_python": "",
     "stt_sidecar": "",
@@ -738,8 +727,6 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "delete_original_after_cut": "delete_original_after_cut",
     "auto_prepare_latest": "auto_prepare_latest",
     "gemini_model": "gemini_model",
-    "opencode_server_url": "opencode_server_url",
-    "opencode_fallback": "opencode_fallback",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",
     "stt_model": "stt_model",

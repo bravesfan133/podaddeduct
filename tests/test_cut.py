@@ -29,6 +29,7 @@ def test_build_ffmpeg_cmd_shape():
         [Interval(0, 10), Interval(20, 30)],
     )
     assert cmd[0] == "/usr/bin/ffmpeg"
+    assert "-threads" in cmd and "1" in cmd
     assert "-filter_complex" in cmd
     assert "-c:a" in cmd and "libmp3lame" in cmd
     assert "-map_metadata" in cmd

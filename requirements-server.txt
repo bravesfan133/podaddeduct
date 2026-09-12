@@ -1,3 +1,2 @@
-# Server (Linux) deps: base app + faster-whisper for CPU transcription.
+# Server (Linux) deps: base app. Transcription is Groq (cloud) by default.
 -r requirements.txt
-faster-whisper>=1.1.0

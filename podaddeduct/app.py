@@ -43,8 +43,6 @@ from .secrets import (
     set_app_password,
     set_gemini_api_key,
     set_groq_api_key,
-    set_zen_api_key,
-    zen_key_status,
 )
 
 logger = logging.getLogger("podaddeduct")
@@ -60,16 +58,6 @@ async def lifespan(_: FastAPI):
     global _poll_task
     _poll_task = asyncio.create_task(_poll_loop())
     try:
-        from .opencode_server import ensure_opencode_serve
-
-        oc = ensure_opencode_serve()
-        if oc.get("ok"):
-            logger.info("OpenCode serve OK: %s (version %s)", oc.get("url"), oc.get("version"))
-        else:
-            logger.warning("OpenCode serve not ready: %s", oc.get("error"))
-    except Exception:
-        logger.exception("OpenCode serve self-check failed")
-    try:
         from .stt import backend_status
 
         st = backend_status()
@@ -80,6 +68,12 @@ async def lifespan(_: FastAPI):
             logger.warning("STT backend BROKEN: %s (see /api/health)", st)
     except Exception:
         logger.exception("STT self-check failed")
+    try:
+        from .decode import vaapi_available
+
+        logger.info("VAAPI (N100 iGPU): %s", "yes" if vaapi_available() else "no")
+    except Exception:
+        logger.exception("VAAPI self-check failed")
     yield
     if _poll_task:
         _poll_task.cancel()
@@ -421,13 +415,12 @@ async def settings_page(request: Request) -> HTMLResponse:
         "min_ad_seconds": db.runtime_float("min_ad_seconds", minimum=1.0, maximum=300.0),
         "silence_snap_window": db.runtime_float("silence_snap_window", minimum=0.0, maximum=10.0),
         "delete_original_after_cut": db.runtime_bool("delete_original_after_cut"),
-        "gemini_model": db.runtime_str("gemini_model"),
-        "opencode_server_url": db.runtime_str("opencode_server_url"),
+        "gemini_model": db.runtime_str("gemini_model") or "gemini-3.5-flash",
         "stt_python": db.runtime_str("stt_python"),
         "stt_sidecar": db.runtime_str("stt_sidecar"),
         "stt_model": db.runtime_str("stt_model"),
     }
-    from .opencode_server import serve_health
+    from .decode import vaapi_available
 
     return templates.TemplateResponse(
         request,
@@ -439,9 +432,8 @@ async def settings_page(request: Request) -> HTMLResponse:
             "global_settings": db.get_global_settings(),
             "effective": eff,
             "gemini": gemini_key_status(),
-            "zen": zen_key_status(),
             "groq": groq_key_status(),
-            "opencode_health": serve_health(),
+            "vaapi": vaapi_available(),
             "password_set": bool(get_app_password()),
             "password_source": password_source(),
             "app_version": APP_VERSION,
@@ -482,6 +474,12 @@ async def api_health(request: Request) -> JSONResponse:
 
     stt = backend_status()
     try:
+        from .decode import vaapi_available
+
+        vaapi = vaapi_available()
+    except Exception:
+        vaapi = False
+    try:
         usage = shutil.disk_usage(settings.data_dir)
         disk = {"total": usage.total, "free": usage.free}
     except OSError:
@@ -489,6 +487,7 @@ async def api_health(request: Request) -> JSONResponse:
     return JSONResponse({
         "ok": bool(stt["ok"]),
         "stt": stt,
+        "vaapi": vaapi,
         "queue_depth": queue_depth(),
         "worker": worker_state(),
         "disk": disk,
@@ -571,24 +570,11 @@ async def save_gemini_key(
 
 
 @app.post("/settings/zen-key")
-async def save_zen_key(
-    request: Request,
-    zen_api_key: str = Form(""),
-    clear: str = Form(""),
-) -> RedirectResponse:
+async def save_zen_key_removed(request: Request) -> RedirectResponse:
+    """OpenCode/Zen removed — redirect so old bookmarks don't 404."""
     if not _authed(request):
         return RedirectResponse("/login", status_code=303)
-    if clear:
-        set_zen_api_key(None)
-    else:
-        set_zen_api_key(zen_api_key)
-    try:
-        from .opencode_server import push_zen_auth
-
-        push_zen_auth()
-    except Exception:
-        logger.warning("Could not push Zen key to opencode serve yet")
-    return RedirectResponse("/settings?saved=zen", status_code=303)
+    return RedirectResponse("/settings?saved=settings", status_code=303)
 
 
 @app.post("/settings/groq-key")
@@ -654,7 +640,7 @@ async def save_global_settings(request: Request) -> RedirectResponse:
         num(k, minimum=0.1 if k in {"max_cache_gb", "min_ad_seconds", "silence_snap_window"} else 1,
             maximum=500 if k == "feed_item_limit" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50)
 
-    for k in ("gemini_model", "opencode_server_url", "stt_python", "stt_sidecar", "stt_model"):
+    for k in ("gemini_model", "stt_python", "stt_sidecar", "stt_model"):
         raw = form.get(k)
         if raw not in (None, ""):
             updates[k] = str(raw).strip()
@@ -731,7 +717,7 @@ async def save_app_password(request: Request) -> RedirectResponse:
 
 @app.post("/api/gemini-test")
 async def api_gemini_test(request: Request) -> JSONResponse:
-    """Test the configured ad detector. OpenCode unless model is gemini-*."""
+    """Test Gemini ad detection with the configured key/model."""
     if not _authed(request):
         raise HTTPException(401, "Sign in first.")
     try:
@@ -752,13 +738,32 @@ async def feed_xml(slug: str, request: Request) -> Response:
     return await render_feed_response(feed, request)
 
 
+SHOW_PAGE_SIZE = 50
+
+
 def _show_page(feed: db.Feed, request: Request) -> HTMLResponse:
-    episodes = db.list_episodes(feed.id)
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except ValueError:
+        page = 1
+    status_filter = (request.query_params.get("status") or "all").strip().lower()
+    if status_filter not in {"all", "ready", "pending"}:
+        status_filter = "all"
+    total = db.count_episodes(feed.id, status_filter=status_filter)
+    total_pages = max(1, (total + SHOW_PAGE_SIZE - 1) // SHOW_PAGE_SIZE)
+    page = min(page, total_pages)
+    offset = (page - 1) * SHOW_PAGE_SIZE
+    episodes = db.list_episodes_page(
+        feed.id, offset=offset, limit=SHOW_PAGE_SIZE, status_filter=status_filter
+    )
     rows = []
     for e in episodes:
         ranges = db.get_ad_ranges(e)
         saved = round(sum(max(0.0, r["end"] - r["start"]) for r in ranges), 1) if ranges else 0.0
-        rows.append({"ep": e, "ads": len(ranges), "saved": saved})
+        remaining = None
+        if e.duration_seconds and saved:
+            remaining = max(0.0, float(e.duration_seconds) - saved)
+        rows.append({"ep": e, "ads": len(ranges), "saved": saved, "remaining": remaining})
     return templates.TemplateResponse(
         request,
         "feed.html",
@@ -769,6 +774,11 @@ def _show_page(feed: db.Feed, request: Request) -> HTMLResponse:
             "keep_last_global": db.global_keep_last(),
             "episodes": episodes,
             "rows": rows,
+            "total_episodes": total,
+            "page": page,
+            "total_pages": total_pages,
+            "status_filter": status_filter,
+            "page_size": SHOW_PAGE_SIZE,
             "public_base": public_base(request),
             "player_url": f"{public_base(request)}/feeds/{feed.slug}.xml",
             "queue": get_queue_details(),
@@ -920,6 +930,22 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
     feed = db.get_feed(ep.feed_id)
     ranges = db.get_ad_ranges(ep)
     saved = round(sum(max(0.0, r["end"] - r["start"]) for r in ranges), 1)
+    remaining = None
+    if ep.duration_seconds is not None:
+        remaining = max(0.0, float(ep.duration_seconds) - saved)
+    # Refuse to celebrate huge "skipped" when cut was refused or remaining is tiny.
+    unsafe_skip = bool(
+        ep.status == "error"
+        and ep.error
+        and ("not cutting" in (ep.error or "").lower() or "original kept" in (ep.error or "").lower())
+    )
+    detection_note = None
+    err = ep.error or ""
+    if err.lower().startswith("detected via"):
+        detection_note = err
+        err_for_friendly = None
+    else:
+        err_for_friendly = ep.error
     transcript_source = None
     try:
         from .stt import load_transcript, transcript_path_for
@@ -938,13 +964,16 @@ async def episode_page(episode_id: int, request: Request) -> HTMLResponse:
             "ranges": ranges,
             "ranges_text": "\n".join(f"{r['start']}-{r['end']}" for r in ranges),
             "saved_seconds": saved,
+            "remaining_seconds": remaining,
+            "unsafe_skip": unsafe_skip,
+            "detection_note": detection_note,
             "public_base": public_base(request),
             "gemini": gemini_key_status(),
-            "gemini_model": db.runtime_str("gemini_model"),
+            "gemini_model": db.runtime_str("gemini_model") or "gemini-3.5-flash",
             "key_saved": request.query_params.get("key_saved"),
             "has_clean": db.has_clean_audio(ep),
             "has_audio": bool(db.served_audio_path(ep)),
-            "friendly_error": friendly_error(ep.error),
+            "friendly_error": friendly_error(err_for_friendly),
             "transcript_source": transcript_source,
         },
     )

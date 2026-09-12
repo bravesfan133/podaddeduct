@@ -15,32 +15,22 @@ def _setup(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_migrate_flash_to_nemotron_free(tmp_path, monkeypatch):
+def test_migrate_opencode_to_gemini(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    db.set_global_settings({"gemini_model": "opencode/deepseek-v4-flash"})
+    db.set_global_settings({"gemini_model": "opencode/nemotron-3-ultra-free"})
     with db.connect() as conn:
-        conn.execute("DELETE FROM kv WHERE key = ?", ("_migrated_nemotron_free",))
+        conn.execute("DELETE FROM kv WHERE key = ?", ("_migrated_gemini_detector_v2",))
     db.init_db()
-    assert db.runtime_str("gemini_model") == "opencode/nemotron-3-ultra-free"
-
-
-def test_migrate_clears_leftover_gemini_model(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    db.set_global_settings({"gemini_model": "gemini-3.6-flash"})
-    with db.connect() as conn:
-        conn.execute("DELETE FROM kv WHERE key = ?", ("_migrated_opencode_detector",))
-    db.init_db()
-    assert db.runtime_str("gemini_model") == settings.gemini_model
-    assert not db.runtime_str("gemini_model").startswith("gemini")
+    assert db.runtime_str("gemini_model") == "gemini-3.5-flash"
 
 
 def test_kv_overrides_env_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    assert db.models_to_try() == [settings.gemini_model]
-    db.set_global_settings({"gemini_model": "gemini-2.0-flash"})
-    assert db.models_to_try() == ["gemini-2.0-flash"]
+    db.set_global_settings({"gemini_model": "gemini-2.0-flash-lite"})
+    assert db.models_to_try() == ["gemini-2.0-flash-lite"]
     db.clear_global_settings(["gemini_model"])
-    assert db.models_to_try() == [settings.gemini_model]
+    # Migration / env default fills gemini-3.5-flash
+    assert "gemini" in db.runtime_str("gemini_model")
 
 
 def test_runtime_coercion(tmp_path, monkeypatch):
@@ -101,7 +91,6 @@ def test_global_save_rejects_bad_values(tmp_path, monkeypatch):
         assert r.status_code == 303
         assert "err=" in r.headers["location"]
         assert r.headers["location"].startswith("/settings?")
-    # Nothing persisted for the bad fields (kv stays empty = inherit)
     assert db.get_global_settings()["min_ad_seconds"] == ""
     assert db.get_global_settings()["public_base_url"] == ""
 
@@ -112,32 +101,25 @@ def test_password_set_change_remove(tmp_path, monkeypatch):
     from podaddeduct.secrets import get_app_password
 
     with TestClient(app) as client:
-        assert client.get("/").status_code == 200  # no password yet
-        # set
+        assert client.get("/").status_code == 200
         r = client.post("/settings/password", data={"new": "s3cret", "confirm": "s3cret"},
                         follow_redirects=False)
         assert r.status_code == 303 and "saved=password" in r.headers["location"]
         assert get_app_password() == "s3cret"
-        # now locked out without cookie (don't follow the redirect)
         assert client.get("/", follow_redirects=False).status_code == 303
-        # sign in to keep managing settings
         r = client.post("/login", data={"password": "s3cret"})
         assert r.status_code == 200
-        # wrong current rejected
         r = client.post("/settings/password",
                         data={"current": "nope", "new": "x", "confirm": "x"},
                         follow_redirects=False)
         assert "err=" in r.headers["location"]
         assert get_app_password() == "s3cret"
-        # change with correct current
         r = client.post("/settings/password",
                         data={"current": "s3cret", "new": "n3w", "confirm": "n3w"},
                         follow_redirects=False)
         assert "saved=password" in r.headers["location"]
-        # password change invalidates the old session cookie — sign in again
         r = client.post("/login", data={"password": "n3w"})
         assert r.status_code == 200
-        # remove
         r = client.post("/settings/password",
                         data={"current": "n3w", "new": "", "confirm": ""},
                         follow_redirects=False)
@@ -146,22 +128,21 @@ def test_password_set_change_remove(tmp_path, monkeypatch):
         assert client.get("/").status_code == 200
 
 
-def test_ad_detection_test_defaults_to_opencode(tmp_path, monkeypatch):
+def test_ad_detection_test_defaults_to_gemini(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
     from podaddeduct.app import app
 
     with (
-        patch.object(seed_mod, "opencode_generate", return_value='{"ads": []}'),
-        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-must-not-use"),
-        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", return_value='{"ads": []}'),
         TestClient(app) as client,
     ):
         r = client.post("/api/gemini-test", json={})
         assert r.status_code == 200
         body = r.json()
         assert body["ok"] is True
-        assert body["provider"] == "opencode"
+        assert body["provider"] == "gemini"
 
 
 def test_ad_detection_test_gemini_model_without_key(tmp_path, monkeypatch):
@@ -182,26 +163,6 @@ def test_ad_detection_test_gemini_model_without_key(tmp_path, monkeypatch):
         assert "Gemini API key" in body["error"]
 
 
-def test_ad_detection_test_serve_down(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import opencode_server as oc
-    from podaddeduct import seed as seed_mod
-    from podaddeduct.app import app
-
-    with (
-        patch.object(oc, "serve_health", return_value={"ok": False, "error": "OpenCode server is not running."}),
-        patch.object(oc, "ensure_opencode_serve", return_value={"ok": False, "error": "OpenCode server is not running."}),
-        patch.object(seed_mod, "_gemini_generate", side_effect=AssertionError("must not call Gemini")),
-        TestClient(app) as client,
-    ):
-        r = client.post("/api/gemini-test", json={})
-        assert r.status_code == 200
-        body = r.json()
-        assert body["ok"] is False
-        assert body["provider"] == "opencode"
-        assert "not running" in body["error"]
-
-
 def test_settings_page_renders(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct.app import app
@@ -209,29 +170,13 @@ def test_settings_page_renders(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.get("/settings")
         assert r.status_code == 200
-        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v", "OpenCode"):
+        for section in ("Storage", "Ad detection", "Processing", "Server", "podaddeduct v", "Gemini"):
             assert section in r.text, section
         assert "adDetectionTest" in r.text
-        assert "geminiTest" not in r.text
-        assert "opencode serve" in r.text
-        assert "opencode/nemotron-3-ultra-free" in r.text
-        assert "opencodeHealthWarn" not in r.text
-
-
-def test_settings_page_warns_when_serve_down(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import opencode_server as oc
-    from podaddeduct.app import app
-
-    with (
-        patch.object(oc, "serve_health", return_value={"ok": False, "error": "OpenCode server is not running."}),
-        TestClient(app) as client,
-    ):
-        r = client.get("/settings")
-        assert r.status_code == 200
-        assert "opencodeHealthWarn" in r.text
-        assert "OpenCode server is not running" in r.text
-        assert "opencode serve --hostname 127.0.0.1 --port 4096" in r.text
+        assert "opencode" not in r.text.lower()
+        assert "OpenCode" not in r.text
+        assert "gemini-3.5-flash" in r.text
+        assert "Test against Gemini" in r.text
 
 
 def test_mutating_routes_need_login(tmp_path, monkeypatch):
@@ -250,7 +195,6 @@ def test_mutating_routes_need_login(tmp_path, monkeypatch):
             assert client.get("/api/search?q=x").status_code == 401
             assert client.get("/api/storage").status_code == 401
             assert client.get("/export.opml").status_code == 303
-            # player routes stay open by design
             feed = db.create_feed(slug="open", upstream_url="https://x.test/rss", title="O")
             assert client.get("/feeds/open.xml").status_code == 200
     finally:
@@ -272,10 +216,32 @@ def test_login_throttle(tmp_path, monkeypatch):
                 assert r.status_code == 200
             r = client.post("/login", data={"password": "wrong"})
             assert r.status_code == 429
-            # correct password still works after the window is cleared
             app_mod._login_attempts.clear()
             r = client.post("/login", data={"password": "s3cret"})
             assert r.status_code == 200
     finally:
         set_app_password("")
         app_mod._login_attempts.clear()
+
+
+def test_show_page_paginates(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct.app import app
+
+    feed = db.create_feed(slug="big", upstream_url="https://x.test/rss", title="Big")
+    for i in range(55):
+        db.upsert_episode(
+            feed.id,
+            guid=f"g{i}",
+            title=f"Ep {i}",
+            enclosure_url=f"https://x.test/{i}.mp3",
+            pub_date=None,
+        )
+    with TestClient(app) as client:
+        r = client.get("/shows/big")
+        assert r.status_code == 200
+        assert "Page 1 of" in r.text
+        assert r.text.count("<tr data-ep-id=") == 50
+        r2 = client.get("/shows/big?page=2")
+        assert r2.status_code == 200
+        assert r2.text.count("<tr data-ep-id=") == 5

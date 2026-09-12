@@ -56,9 +56,12 @@ def build_ffmpeg_cmd(
     filt = build_atrim_filter(content)
     # -map_metadata 0 keeps ID3 tags (title/artist) from the source.
     # Cover art is often a video/attached_pic stream; map it if present.
+    # Cap threads so N100 E-cores aren't saturated during re-encode.
     return [
         ffmpeg,
         "-y",
+        "-threads",
+        "1",
         "-i",
         str(src),
         "-filter_complex",
@@ -79,6 +82,103 @@ def build_ffmpeg_cmd(
         "3",
         str(dest),
     ]
+
+
+def _probe_audio_codec(path: Path) -> str:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return ""
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return ((getattr(proc, "stdout", None) or "")).strip().lower()
+
+
+def _try_stream_copy_concat(
+    ffmpeg: str,
+    src: Path,
+    dest: Path,
+    content: list[Interval],
+) -> bool:
+    """Prefer -c copy concat when source audio is already MP3 (no lame)."""
+    if _probe_audio_codec(src) not in {"mp3", "mp3float"}:
+        return False
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="podcut_") as td:
+            tdir = Path(td)
+            list_path = tdir / "concat.txt"
+            lines: list[str] = []
+            for i, span in enumerate(content):
+                part = tdir / f"part{i}.mp3"
+                dur = max(0.01, span.end - span.start)
+                cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-threads",
+                    "1",
+                    "-ss",
+                    f"{span.start:.3f}",
+                    "-t",
+                    f"{dur:.3f}",
+                    "-i",
+                    str(src),
+                    "-c",
+                    "copy",
+                    "-map",
+                    "0:a:0",
+                    str(part),
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0 or not part.exists() or part.stat().st_size < 64:
+                    return False
+                esc = str(part).replace("'", r"'\''")
+                lines.append(f"file '{esc}'")
+            list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            out_tmp = dest.with_name(dest.stem + ".partial" + dest.suffix)
+            concat_cmd = [
+                ffmpeg,
+                "-y",
+                "-threads",
+                "1",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                "-id3v2_version",
+                "3",
+                str(out_tmp),
+            ]
+            proc = subprocess.run(concat_cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0 or not out_tmp.exists():
+                try:
+                    out_tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+            out_tmp.replace(dest)
+            return True
+    except OSError:
+        return False
 
 
 def cut_ads(
@@ -103,6 +203,9 @@ def cut_ads(
 
     ffmpeg = find_ffmpeg()
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if _try_stream_copy_concat(ffmpeg, src, dest, content):
+        logger.info("ffmpeg copy-concat %s -> %s (%d spans)", src.name, dest.name, len(content))
+        return dest
     tmp = dest.with_name(dest.stem + ".partial" + dest.suffix)
     cmd = build_ffmpeg_cmd(ffmpeg, src, tmp, content)
     logger.info("ffmpeg cut %s -> %s (%d content spans)", src.name, dest.name, len(content))

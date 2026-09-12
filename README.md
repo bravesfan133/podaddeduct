@@ -12,9 +12,9 @@ cp -n .env.example .env 2>/dev/null || true
 
 Open `http://127.0.0.1:8080/`:
 
-1. **Search** for a show by name, press Add. Ad detection uses local `opencode serve` (`opencode/nemotron-3-ultra-free`). Paste your Zen key in Settings. Optional Gemini is under Settings → Ad detection → Gemini.
+1. **Search** for a show by name, press Add. Ad detection uses **Gemini** (`gemini-3.5-flash` by default) on a full transcript. Paste your Gemini key in Settings. Transcription defaults to Groq Whisper on Docker / N100 hosts (Parakeet on Mac).
 2. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
-3. **Play.** New episodes prepare automatically; first play waits until the clean file is ready (never streams the with-ads original). Afterwards it's instant.
+3. **Play.** New episodes prepare automatically; first clean takes a few minutes (scan + cut). Afterwards it's instant.
 
 ## How it stays small
 
@@ -33,23 +33,18 @@ Podcast-app refresh checks (`HEAD`) never start work. The custom RSS lists **Rea
 Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
-2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
-3. Cheap **sponsor-read heuristics**, then **OpenCode serve** (`opencode/nemotron-3-ultra-free`) in one shot.
-4. Snap to silence, cut with ffmpeg (ID3 tags and cover art preserved).
+2. **Chromaprint fingerprints** of ads cut on earlier episodes of the same show (inserted spots).
+3. **Publisher transcript** in the RSS (free) → else Groq Whisper (Docker) / Parakeet (Mac).
+4. **One Gemini `generateContent` call** on the full transcript (host-reads + missed inserts). Temperature 0.2; server-side max span (~3 min midrolls) and coverage guards refuse unsafe cuts.
+5. Snap edges near transcript times / short silence windows, cut with ffmpeg (`-threads 1`; stream-copy when the source is already MP3).
 
-Everything is configured in **Settings** — no config files needed:
+Everything is configured in **Settings**:
 
-- **Ad detection:** paste a Zen key once. Test pings `opencode serve` (`GET /global/health`) then a tiny session message. Gemini key is optional and only used if you set a `gemini-*` model.
-- **Server:** transcription backend (Mac Parakeet / Linux faster-whisper / optional Groq Whisper), Groq key for cloud STT only, public address for Overcast, family password.
+- **Ad detection:** Gemini API key + model (`gemini-3.5-flash`). Test talks to Gemini.
+- **Server:** transcription backend (Groq recommended on N100), Groq key, public address for Overcast, family password. Health shows ffmpeg + VAAPI yes/no.
 - **Processing:** how many episodes to prepare, shortest ad to cut.
 
-The app starts `opencode serve --hostname 127.0.0.1 --port 4096` if the CLI is on PATH. You can also start it yourself. If serve is down, obvious sponsor-read phrases ("sponsored by", promo codes, etc.) are still cut via heuristics. Optional live check:
-
-```bash
-./scripts/test_zen_ad_detection.sh
-```
-
-## Home server (Docker)
+## Home server (Docker / Intel N100)
 
 ```bash
 git clone git@github.com:bravesfan133/podaddeduct.git
@@ -59,7 +54,9 @@ docker compose up -d --build
 
 Data (DB, audio, transcripts) lives in the `podaddeduct-data` volume. The app serves port **7887**: point your Cloudflare Tunnel hostname at `http://localhost:7887` (tunnel on the same machine) and set that `https://…` URL as the public address in Settings.
 
-The image includes the OpenCode CLI and starts `opencode serve` in the same container (no second Compose service). Paste the Zen key in Settings, or set `ZEN_API_KEY`. If serve already runs on the host instead, set `OPENCODE_SERVER_URL` (e.g. `http://172.17.0.1:4096`).
+Compose passes through the N100 iGPU (`/dev/dri`, `LIBVA_DRIVER_NAME=iHD`) so ffmpeg can use **VAAPI decode** when the codec allows. Chromaprint (`fpcalc`), Groq, Gemini, and MP3 encoding stay on CPU — Quick Sync does not encode MP3. Idle process list should be uvicorn only (no OpenCode).
+
+If `getent group render video` on the host shows non-standard GIDs, adjust `group_add` in `compose.yaml`.
 
 ## Outside home Wi-Fi / Overcast
 
@@ -77,9 +74,3 @@ Overcast and Pocket Casts fetch from their servers, so they need a public `https
 ## Move shows between apps
 
 OPML import on the home page, backup via `/export.opml`.
-
-## Tests
-
-```bash
-.venv/bin/python -m pytest -q
-```

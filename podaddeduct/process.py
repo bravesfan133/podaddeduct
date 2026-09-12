@@ -11,10 +11,17 @@ from pathlib import Path
 from . import db
 from .config import settings
 from .cut import clean_path_for, cut_ads
-from .decode import load_mono_pcm
+from .decode import load_mono_pcm, probe_duration
 from .download import complete_marker_for, download_file
 from .intervals import Interval
-from .seed import effective_min_ad_seconds, filter_min_duration, find_ads_with_zen, snap_to_silence
+from .seed import (
+    effective_min_ad_seconds,
+    evaluate_cut_guards,
+    filter_max_duration,
+    filter_min_duration,
+    find_ads_with_zen,
+    snap_edges_windowed,
+)
 from .stt import transcribe_audio, transcript_path_for
 
 logger = logging.getLogger("podaddeduct.process")
@@ -31,9 +38,9 @@ _recent_completed: deque[dict] = deque(maxlen=5)
 _STAGE_LABELS = {
     "queued": "Waiting",
     "downloading": "Downloading",
-    "decoding": "Reading audio",
+    "matching": "Matching inserts",
     "transcribing": "Transcribing",
-    "detecting": "Finding ads",
+    "detecting": "Labeling ads",
     "cutting": "Cutting",
     "finishing": "Finishing",
 }
@@ -108,12 +115,12 @@ def describe_job(job: dict | None = None) -> str:
         return "Waiting in line…"
     if stage == "downloading":
         return f"Downloading… {detail}" if detail else "Downloading…"
-    if stage == "decoding":
-        return "Reading audio…"
+    if stage == "matching":
+        return "Matching known ad inserts…"
     if stage == "transcribing":
-        return "Transcribing speech… (slowest step, can take a while)"
+        return "Transcribing speech…"
     if stage == "detecting":
-        return "Finding ads…"
+        return "Finding ads (one Gemini pass)…"
     if stage == "cutting":
         return "Cutting clean file…"
     if stage == "finishing":
@@ -296,12 +303,17 @@ def friendly_error(err: str | None) -> str:
         return ""
     if "transcription tool not found" in text or "transcription script missing" in text:
         return "Transcription isn't set up — check Settings → Server."
-    if "stt failed" in text or "faster_whisper" in text or "whisper" in text:
-        return "Speech-to-text failed — check server logs, then hit Prepare to retry."
-    if "opencode serve" in text or "opencode server is not running" in text:
-        return "Ad detection needs OpenCode serve — check Settings → Ad detection."
+    if "stt failed" in text or "faster_whisper" in text or "whisper" in text or "groq" in text:
+        return "Speech-to-text failed — check Groq key / server logs, then hit Prepare to retry."
+    # Coverage / max-span refusal must win over the generic "ad detection" match.
+    if ("not cutting" in text or "original kept" in text) and (
+        "marked" in text or "would leave" in text or "unsafe" in text or "%" in text
+    ):
+        return "Ad marks looked unsafe (would wipe most of the episode) — original kept. Fix by hand or Re-check."
     if "gemini" in text and ("key" in text or "401" in text or "403" in text or "auth" in text or "api key" in text):
         return "Ad detection needs a valid Gemini API key — check Settings → Ad detection."
+    if "gemini" in text or "ad detection" in text:
+        return "Ad detection failed — check Settings → Ad detection, then hit Prepare to retry."
     if "ffmpeg" in text:
         return "Audio cutting failed — check server logs, then hit Prepare to retry."
     if "no space" in text or "errno 28" in text or "disk" in text:
@@ -416,30 +428,41 @@ def _recut_saved(episode_id: int, audio_path: Path, saved: list[dict]) -> None:
     from .chapters import dicts_to_intervals
 
     logger.info("episode %s re-cutting from %d saved marks (no AI needed)", episode_id, len(saved))
-    pcm, sr = load_mono_pcm(audio_path)
-    duration = len(pcm) / float(sr)
+    duration = probe_duration(audio_path)
+    if duration <= 0:
+        pcm, sr = load_mono_pcm(audio_path)
+        duration = len(pcm) / float(sr)
     ads = dicts_to_intervals([{"start": float(r["start"]), "end": float(r["end"])} for r in saved])
     _finalize(episode_id, audio_path, duration, ads)
 
 
 def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
+    from .chapters import try_publisher_chapters
+    from .fingerprint import match_ads_in_episode
+    from .intervals import merge_intervals
+    from .seed import union_ranges
+
     t_all = time.monotonic()
     logger.info("episode %s detecting ads", episode_id)
-    db.update_episode(episode_id, status="working", error="Finding ads…")
-    _job_stage("decoding")
-    pcm, sr = load_mono_pcm(audio_path)
-    duration = len(pcm) / float(sr)
+    db.update_episode(episode_id, status="working", error="Matching inserts…")
+
+    duration = probe_duration(audio_path)
+    if duration <= 0:
+        _job_stage("matching")
+        pcm, sr = load_mono_pcm(audio_path)
+        duration = len(pcm) / float(sr)
 
     ep = db.get_episode(episode_id)
+    snap_win = db.runtime_float("silence_snap_window", minimum=0.0)
+    sources: list[str] = []
 
     # 1) Publisher chapters with Ad/Sponsor titles — cut, no AI.
-    from .chapters import try_publisher_chapters
-
     pub_ads = try_publisher_chapters(ep, duration) if ep is not None else None
     if pub_ads:
-        ads = snap_to_silence(pub_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
+        ads = snap_edges_windowed(pub_ads, audio_path, duration, window=snap_win)
         ads = filter_min_duration(ads, min_seconds=effective_min_ad_seconds())
-        _finalize(episode_id, audio_path, duration, ads)
+        ads = filter_max_duration(ads, duration=duration)
+        _finalize(episode_id, audio_path, duration, ads, sources=["chapters"])
         logger.info(
             "episode %s done via publisher chapters (%d ads, total %.0fs)",
             episode_id,
@@ -448,7 +471,19 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         )
         return
 
-    # 2) Transcript → heuristics → LLM on leftovers.
+    # 2) Chromaprint match known inserts from this show (no Gemini).
+    fp_hits: list[Interval] = []
+    if ep is not None:
+        _job_stage("matching")
+        try:
+            fp_hits = match_ads_in_episode(ep.feed_id, audio_path, duration)
+            if fp_hits:
+                sources.append("fingerprint")
+                logger.info("episode %s fingerprint matched %d ranges", episode_id, len(fp_hits))
+        except Exception:
+            logger.exception("fingerprint match failed for episode %s", episode_id)
+
+    # 3) Transcript → one Gemini pass on the full transcript.
     db.update_episode(episode_id, status="working", error="Transcribing…")
     _job_stage("transcribing")
     t0 = time.monotonic()
@@ -469,11 +504,14 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         transcript.setdefault("source", "local")
     n_sent = len((transcript.get("sentences") or []))
     logger.info("episode %s transcribed %d sentences in %.0fs", episode_id, n_sent, time.monotonic() - t0)
-    db.update_episode(episode_id, status="working", error="Finding ads…")
+
+    db.update_episode(episode_id, status="working", error="Labeling ads…")
     _job_stage("detecting")
     t0 = time.monotonic()
     detection = find_ads_with_zen(transcript, progress_cb=_job_progress)
     detected = detection.ranges
+    if detection.sources:
+        sources.extend(detection.sources)
     logger.info(
         "episode %s ad detection found %d ranges in %.0fs (gemini_ok=%s)",
         episode_id,
@@ -481,23 +519,21 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         time.monotonic() - t0,
         detection.gemini_ok,
     )
-    ads = snap_to_silence(detected, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
+
+    merged = union_ranges(fp_hits, detected)
+    ads = snap_edges_windowed(merged, audio_path, duration, window=snap_win)
     ads = filter_min_duration(ads, min_seconds=effective_min_ad_seconds())
+    ads = filter_max_duration(ads, duration=duration)
 
     warn = None
     if detection.gemini_error and not detection.gemini_ok:
         warn = (
-            "AI ad detection failed — only obvious sponsor phrases were used. "
-            "Press Re-check after OpenCode serve is healthy (Settings → Ad detection). "
+            "AI ad detection failed — only tight sponsor phrases (if any) were used. "
+            "Check Settings → Ad detection (Gemini key), then Re-check. "
             f"({detection.gemini_error[:180]})"
         )
-    elif detection.gemini_error:
-        warn = (
-            "AI ad detection had partial failures on some transcript chunks. "
-            f"Re-check if ads remain. ({detection.gemini_error[:180]})"
-        )
 
-    _finalize(episode_id, audio_path, duration, ads, warning=warn)
+    _finalize(episode_id, audio_path, duration, ads, warning=warn, sources=sources or None)
     logger.info("episode %s done with %d ad ranges (total %.0fs)", episode_id, len(ads), time.monotonic() - t_all)
 
 
@@ -508,24 +544,55 @@ def _finalize(
     ads: list[Interval],
     *,
     warning: str | None = None,
+    sources: list[str] | None = None,
 ) -> None:
     from .chapters import intervals_to_dicts
+    from .fingerprint import store_ad_fingerprints
 
     _job_stage("finishing")
+    guard = evaluate_cut_guards(ads, duration)
+    if not guard.ok:
+        logger.warning("episode %s cut refused: %s", episode_id, guard.reason)
+        db.update_episode(
+            episode_id,
+            audio_path=str(audio_path),
+            duration_seconds=duration,
+            ad_ranges_json=json.dumps(intervals_to_dicts(guard.ranges)),
+            status="error",
+            error=(guard.reason or "Ad marks unsafe — original kept.")[:1500],
+            clean_audio_path=None,
+            size_bytes=_file_size(audio_path),
+        )
+        return
+
+    ads = guard.ranges
     ad_dicts = intervals_to_dicts(ads)
     fields: dict = {
         "audio_path": str(audio_path),
         "duration_seconds": duration,
         "ad_ranges_json": json.dumps(ad_dicts),
         "status": "ready",
-        "error": (warning[:1500] if warning else None),
+        "error": None,
     }
+    if warning:
+        fields["error"] = warning[:1500]
+    elif sources:
+        fields["error"] = ("Detected via: " + ", ".join(sources))[:1500]
+    if sources:
+        logger.info("episode %s ad sources: %s", episode_id, ",".join(sources))
 
     clean_path = clean_path_for(episode_id)
     if ads:
         try:
             _job_stage("cutting")
             t0 = time.monotonic()
+            # Store fingerprints from original BEFORE optional delete.
+            ep = db.get_episode(episode_id)
+            if ep is not None:
+                try:
+                    store_ad_fingerprints(ep.feed_id, episode_id, audio_path, ads)
+                except Exception:
+                    logger.exception("fingerprint store failed for episode %s", episode_id)
             cut_ads(audio_path, ads, clean_path, duration=duration)
             logger.info("episode %s ffmpeg cut done in %.0fs", episode_id, time.monotonic() - t0)
             fields["clean_audio_path"] = str(clean_path)
@@ -555,7 +622,6 @@ def _finalize(
     if fields.get("status") in {"ready", "manual"}:
         _record_completed(episode_id)
 
-    # Opportunistic janitor so disk never grows unbounded.
     try:
         from .retain import run_janitor
 
@@ -582,8 +648,10 @@ async def apply_manual_ranges(episode_id: int, ad_dicts: list[dict[str, float]])
         audio_path = await download_file(ep.enclosure_url, audio_path_for(episode_id))
         db.update_episode(episode_id, audio_path=str(audio_path))
 
-    pcm, sr = load_mono_pcm(audio_path)
-    duration = len(pcm) / float(sr)
+    duration = probe_duration(audio_path)
+    if duration <= 0:
+        pcm, _sr = load_mono_pcm(audio_path)
+        duration = len(pcm) / float(_sr)
     ads = dicts_to_intervals(ad_dicts)
     clean_path = clean_path_for(episode_id)
     clean_audio_path: str | None = None

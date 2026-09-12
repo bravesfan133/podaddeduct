@@ -44,6 +44,9 @@ def test_friendly_error_mapping():
     assert "API key" in friendly_error("gemini 401 unauthorized key invalid")
     assert "disk" in friendly_error("OSError: [Errno 28] No space left on device").lower()
     assert "download" in friendly_error("ConnectTimeout while fetching enclosure").lower()
+    assert "unsafe" in friendly_error(
+        "Ad detection marked 82% of this episode. Original kept — not cutting."
+    ).lower()
     assert friendly_error("Something totally novel exploded") != ""
 
 
@@ -56,6 +59,7 @@ def test_health_endpoint(tmp_path, monkeypatch):
         assert r.status_code == 200
         body = r.json()
         assert "ok" in body and "stt" in body and "queue_depth" in body and "disk" in body
+        assert "vaapi" in body
 
 
 def test_episode_page_shows_friendly_error(tmp_path, monkeypatch):
@@ -72,3 +76,25 @@ def test_episode_page_shows_friendly_error(tmp_path, monkeypatch):
         assert r.status_code == 200
         assert "Transcription isn" in r.text  # autoescaped apostrophe
         assert "Technical details" in r.text
+
+
+def test_episode_page_refused_cut_not_ready(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct.app import app
+
+    feed = db.create_feed(slug="e2", upstream_url="https://example.com/rss", title="E")
+    ep = db.upsert_episode(feed.id, guid="g2", title="Wipe",
+                           enclosure_url="https://example.com/e2.mp3", pub_date=None)
+    db.update_episode(
+        ep.id,
+        status="error",
+        duration_seconds=3720,
+        ad_ranges_json='[{"start":543,"end":3607}]',
+        error="Ad detection marked 82% of this episode. Original kept — not cutting.",
+    )
+    with TestClient(app) as client:
+        r = client.get(f"/episodes/{ep.id}")
+        assert r.status_code == 200
+        assert "Couldn" in r.text and "safely" in r.text
+        assert "Ready — ads removed" not in r.text
+        assert "52:04" not in r.text

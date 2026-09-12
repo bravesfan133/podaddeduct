@@ -93,19 +93,20 @@ def test_find_ads_with_gemini_mocked():
 
     seen_bodies = []
 
-    def fake_oc(user_content, model=None, **kwargs):
+    def fake_gen(api_key, model, user_content):
         seen_bodies.append(user_content)
         return '{"ads": [{"start": "00:06:40", "end": "00:07:25", "type": "inserted_ad", "sponsor": "unknown", "confidence": 0.9}]}'
 
-    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gen),
+    ):
         result = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
     ads = result.ranges
-    # Full transcript (including heuristic-covered sponsor lines) goes to the model.
     assert seen_bodies and "brought to you" in seen_bodies[0]
     assert "car commercial" in seen_bodies[0]
-    # Heuristic covers the sponsor block; model covers midroll.
-    assert len(ads) >= 2
-    assert ads[0].start <= 4.5
+    # One Gemini call only — no heuristic union on success.
+    assert len(seen_bodies) == 1
     assert any(a.start >= 390 for a in ads)
     assert result.gemini_ok
 
@@ -136,15 +137,15 @@ def test_heuristic_ads_finds_sports_cues():
     transcript = {
         "sentences": [
             {"text": "Welcome back.", "start": 0.0, "end": 3.0},
-            {"text": "This episode is presented by FanDuel.", "start": 3.0, "end": 12.0},
-            {"text": "If you or someone you know has a gambling problem call 1-800-GAMBLER.", "start": 12.0, "end": 25.0},
+            {"text": "This episode is brought to you by FanDuel.", "start": 3.0, "end": 12.0},
+            {"text": "Use promo code CELTICS for a free bet.", "start": 12.0, "end": 25.0},
             {"text": "Back to the Celtics.", "start": 25.0, "end": 30.0},
         ]
     }
     ads = heuristic_ads(transcript)
     assert len(ads) >= 1
     assert ads[0].start <= 3.5
-    assert ads[0].end >= 24.0  # merged across the FanDuel + helpline block
+    assert ads[0].end >= 24.0  # merged across sponsor + promo code block
 
 
 def test_filter_rejects_micro_cuts():
@@ -165,10 +166,9 @@ def test_find_ads_progress_callback():
 
     seen = []
 
-    def fake_oc(user_content, model=None, **kwargs):
+    def fake_gen(api_key, model, user_content):
         return '{"ads": []}'
 
-    # Transcript with no heuristic hits so the model runs once.
     plain = {
         "sentences": [
             {"text": "Baseball talk one.", "start": 0.0, "end": 10.0},
@@ -177,7 +177,10 @@ def test_find_ads_progress_callback():
         ]
     }
 
-    with patch.object(seed_mod, "opencode_generate", side_effect=fake_oc):
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=fake_gen),
+    ):
         seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
     assert seen[-1][0] == seen[-1][1]
@@ -187,4 +190,4 @@ def test_default_gemini_model():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["gemini_model"].default
-    assert default == "opencode/nemotron-3-ultra-free"
+    assert default == "gemini-3.5-flash"

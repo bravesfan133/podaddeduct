@@ -27,7 +27,7 @@
   <div class="showhead">
     {% if feed.artwork_url %}<img src="{{ feed.artwork_url }}" alt="" />{% endif %}
     <div><h1 style="margin:0">{{ feed.title or feed.slug }}</h1>
-    <p class="muted" style="margin:0.25rem 0 0">{{ episodes|length }} episodes tracked · oldest delete themselves</p></div>
+    <p class="muted" style="margin:0.25rem 0 0">{{ total_episodes }} episodes tracked · oldest delete themselves</p></div>
   </div>
 
   <div class="card queue-card" id="queueCard" {% if not queue.active %}style="display:none"{% endif %}>
@@ -68,6 +68,20 @@
     </form>
   </div>
 
+  <div class="card" style="padding-bottom:0.5rem">
+    <form method="get" action="/shows/{{ feed.slug }}" style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:end">
+      <div>
+        <label>Show</label>
+        <select name="status" onchange="this.form.submit()">
+          <option value="all" {% if status_filter == 'all' %}selected{% endif %}>All</option>
+          <option value="ready" {% if status_filter == 'ready' %}selected{% endif %}>Ready</option>
+          <option value="pending" {% if status_filter == 'pending' %}selected{% endif %}>Pending</option>
+        </select>
+      </div>
+      <p class="muted" style="margin:0 0 0.55rem">Page {{ page }} of {{ total_pages }} · {{ page_size }} per page</p>
+    </form>
+  </div>
+
   <table>
     <thead><tr><th>Episode</th><th>Status</th><th>Saved</th><th></th></tr></thead>
     <tbody>
@@ -80,14 +94,21 @@
           {% elif r.ep.status == 'error' %}<span class="pill warn">Needs attention</span>
           {% else %}<span class="pill">New</span>{% endif %}
         </td>
-        <td class="muted" data-saved-cell>{% if r.ads %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
+        <td class="muted" data-saved-cell>{% if r.ads and r.ep.status in ('ready', 'manual') %}{{ r.ads }} ads · {{ '%d:%02d'|format(r.saved//60, r.saved%60) }}{% else %}—{% endif %}</td>
         <td data-action-cell>{% if r.ep.status in ('pending', 'error') %}<form method="post" action="/episodes/{{ r.ep.id }}/recheck" style="display:inline"><button type="submit" class="ghost" style="margin:0;padding:0.35rem 0.7rem;font-size:0.85rem">Prepare</button></form>{% endif %}</td>
       </tr>
     {% else %}
-      <tr><td colspan="4" class="muted">No episodes yet — press “Check for new episodes”.</td></tr>
+      <tr><td colspan="4" class="muted">No episodes on this page — press “Check for new episodes” or change the filter.</td></tr>
     {% endfor %}
     </tbody>
   </table>
+  {% if total_pages > 1 %}
+  <p style="display:flex;gap:1rem;justify-content:center;margin:1.25rem 0">
+    {% if page > 1 %}<a href="/shows/{{ feed.slug }}?status={{ status_filter }}&page={{ page - 1 }}">← Newer</a>{% endif %}
+    <span class="muted">{{ page }} / {{ total_pages }}</span>
+    {% if page < total_pages %}<a href="/shows/{{ feed.slug }}?status={{ status_filter }}&page={{ page + 1 }}">Older →</a>{% endif %}
+  </p>
+  {% endif %}
 <script>
 const FEED_SLUG = {{ feed.slug | tojson }};
 const FEED_ID = {{ feed.id | tojson }};

@@ -21,7 +21,9 @@
   </div>
   <h1>{{ episode.title }}</h1>
   <p class="muted" id="statusline">
-    {% if episode.status == 'ready' or episode.status == 'manual' %}
+    {% if unsafe_skip %}
+      <span class="pill warn">Couldn’t mark ads safely — original kept</span>
+    {% elif episode.status == 'ready' or episode.status == 'manual' %}
       <span class="pill ok">Ready — ads removed</span>
     {% elif episode.status == 'working' %}
       <span class="pill warn">Cleaning… this page updates itself</span>
@@ -30,9 +32,16 @@
     {% else %}
       <span class="pill">New — press Prepare below</span>
     {% endif %}
-    {% if saved_seconds %}&nbsp;·&nbsp;{{ '%d:%02d'|format(saved_seconds//60, saved_seconds%60) }} of ads skipped{% endif %}
+    {% if episode.status in ('ready', 'manual') and saved_seconds and remaining_seconds is not none and remaining_seconds >= 120 %}
+      &nbsp;·&nbsp;{{ '%d:%02d'|format(saved_seconds//60, saved_seconds%60) }} of ads skipped
+    {% elif episode.status in ('ready', 'manual') and saved_seconds and (remaining_seconds is none or remaining_seconds >= 120) %}
+      &nbsp;·&nbsp;{{ '%d:%02d'|format(saved_seconds//60, saved_seconds%60) }} of ads skipped
+    {% endif %}
     {% if transcript_source %}&nbsp;·&nbsp;Transcript: {{ transcript_source }}{% endif %}
   </p>
+  {% if detection_note and episode.status in ('ready', 'manual') %}
+  <p class="muted" style="margin-top:0">{{ detection_note }}</p>
+  {% endif %}
   {% if episode.status == 'error' %}
   <p class="err">{{ friendly_error or "Processing failed — hit Prepare below to retry." }}</p>
   {% if episode.error %}
@@ -40,7 +49,7 @@
     <pre class="err" style="white-space:pre-wrap;font-size:0.8rem">{{ episode.error }}</pre>
   </details>
   {% endif %}
-  {% elif episode.error and episode.status in ('ready', 'manual') %}
+  {% elif episode.error and episode.status in ('ready', 'manual') and not detection_note %}
   <div class="player" style="border-color:var(--warn, #c90)">
     <b>Ad detection warning</b>
     <p class="muted" style="margin:0.35rem 0 0">{{ episode.error }}</p>
