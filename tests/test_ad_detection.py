@@ -168,7 +168,7 @@ def test_gemini_model_default(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    assert seed_mod.gemini_model() == "gemini-3.6-flash"
+    assert seed_mod.gemini_model() == "gemini-3.5-flash"
     db.set_global_settings({"gemini_model": "gemini-2.5-flash"})
     assert seed_mod.gemini_model() == "gemini-2.5-flash"
 
@@ -222,7 +222,7 @@ def test_find_ads_uses_gemini(tmp_path, monkeypatch):
         result = seed_mod.find_ads_with_zen(transcript)
     assert len(result.ranges) == 1
     assert result.gemini_ok
-    assert calls and calls[0] == "gemini-3.6-flash"
+    assert calls and calls[0] == "gemini-3.5-flash"
 
 
 def test_find_ads_without_key_uses_heuristics_only(tmp_path, monkeypatch):
@@ -301,20 +301,19 @@ def test_micro_cuts_filtered_when_gemini_fails(tmp_path, monkeypatch):
     assert not any(r.duration < 15 for r in result.ranges)
 
 
-def test_chunked_gemini_merges_across_long_transcript(tmp_path, monkeypatch):
+def test_full_transcript_gemini_ad_detection(tmp_path, monkeypatch):
+    """Full transcript is sent in one request to save API quota and preserve context."""
     _setup(tmp_path, monkeypatch)
     import json
 
     from podaddeduct import seed as seed_mod
 
-    # Build a long transcript that forces multiple chunks.
     sentences = []
     t = 0.0
     for i in range(200):
         text = f"Baseball content sentence number {i} with enough filler words to grow."
         sentences.append({"text": text, "start": t, "end": t + 8.0})
         t += 8.0
-    # Ad early and late so they land in different chunks.
     sentences[5] = {"text": "This midroll is a car commercial pitch.", "start": 40.0, "end": 100.0}
     sentences[150] = {"text": "Post show sponsor read continues here.", "start": 1200.0, "end": 1280.0}
     transcript = {"sentences": sentences}
@@ -323,28 +322,42 @@ def test_chunked_gemini_merges_across_long_transcript(tmp_path, monkeypatch):
 
     def fake_gemini(api_key, model, user_content):
         bodies.append(user_content)
-        out = []
-        if "car commercial" in user_content:
-            out.append({"start": 40.0, "end": 100.0})
-        if "sponsor read" in user_content:
-            out.append({"start": 1200.0, "end": 1280.0})
-        return json.dumps(out)
+        return json.dumps([
+            {"start": 40.0, "end": 100.0},
+            {"start": 1200.0, "end": 1280.0},
+        ])
 
     seen_progress = []
     with (
         patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
         patch.object(seed_mod, "_gemini_generate", side_effect=fake_gemini),
-        patch.object(seed_mod, "GEMINI_CHUNK_MAX_CHARS", 800),
     ):
         result = seed_mod.find_ads_with_gemini(
             transcript, progress_cb=lambda d, tot: seen_progress.append((d, tot))
         )
     assert result.gemini_ok
-    assert len(bodies) >= 2, "expected multiple Gemini chunks"
+    assert len(bodies) == 1, "expected exactly 1 Gemini request per episode"
+    assert "car commercial pitch" in bodies[0]
+    assert "sponsor read continues" in bodies[0]
     assert len(result.ranges) == 2
     assert result.ranges[0].start == 40.0
     assert result.ranges[1].end == 1280.0
     assert seen_progress and seen_progress[-1][0] == seen_progress[-1][1]
+
+
+def test_gemini_quota_exceeded_fails_fast_without_retries(tmp_path, monkeypatch):
+    """HTTP 429 quota exhaustion must fail immediately without wasting retry sleep loops."""
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    quota_resp = _FakeResp(429, {}, text="You exceeded your current quota, please check your plan and billing details.")
+    fake = _FakeClient([quota_resp])
+    with patch.object(seed_mod.httpx, "Client", return_value=fake):
+        with pytest.raises(RuntimeError) as exc_info:
+            seed_mod._gemini_generate("k", "gemini-3.5-flash", "hi")
+        assert "Gemini quota exceeded" in str(exc_info.value)
+    # Must have only posted ONCE (no retry loop on hard quota error)
+    assert len(fake.posts) == 1
 
 
 def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):
@@ -356,8 +369,57 @@ def test_settings_save_accepts_gemini_model(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "gemini_model": "gemini-3.6-flash"},
+            data={"settings_form": "1", "gemini_model": "gemini-3.5-flash"},
             follow_redirects=False,
         )
         assert r.status_code == 303
-    assert db.runtime_str("gemini_model") == "gemini-3.6-flash"
+    assert db.runtime_str("gemini_model") == "gemini-3.5-flash"
+
+
+def test_opencode_direct_routing(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    transcript = {
+        "sentences": [
+            {"text": "Welcome to the show.", "start": 0.0, "end": 10.0},
+            {"text": "Ad here.", "start": 10.0, "end": 40.0},
+        ]
+    }
+    db.set_global_settings({"gemini_model": "opencode/kimi-k2.5"})
+
+    with patch.object(seed_mod, "opencode_generate", return_value='[{"start": 10.0, "end": 40.0}]') as mock_gen:
+        res = seed_mod.find_ads_with_gemini(transcript)
+    assert res.gemini_ok
+    assert len(res.ranges) == 1
+    assert res.ranges[0].start == 10.0
+    mock_gen.assert_called_once()
+    assert mock_gen.call_args[1]["model"] == "opencode/kimi-k2.5"
+
+
+def test_gemini_quota_falls_back_to_opencode_when_enabled(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    transcript = {
+        "sentences": [
+            {"text": "Welcome to the show.", "start": 0.0, "end": 10.0},
+            {"text": "Ad break content.", "start": 10.0, "end": 40.0},
+        ]
+    }
+    db.set_global_settings({"opencode_fallback": "1"})
+
+    def boom(*a, **k):
+        raise RuntimeError("Gemini quota exceeded: 429 quota")
+
+    with (
+        patch.object(seed_mod, "resolve_gemini_api_key", return_value="AIza-test"),
+        patch.object(seed_mod, "_gemini_generate", side_effect=boom),
+        patch.object(seed_mod, "is_opencode_available", return_value=True),
+        patch.object(seed_mod, "opencode_generate", return_value='[{"start": 10.0, "end": 40.0}]') as mock_gen,
+    ):
+        res = seed_mod.find_ads_with_gemini(transcript)
+    assert res.gemini_ok
+    assert len(res.ranges) == 1
+    assert res.ranges[0].start == 10.0
+    mock_gen.assert_called_once()

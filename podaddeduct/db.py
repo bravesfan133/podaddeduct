@@ -637,8 +637,9 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (Google Gemini Direct Free API)
+    # Ad detection (Google Gemini Direct Free API / OpenCode CLI)
     "gemini_model": "",
+    "opencode_fallback": "",
     # Transcription backend
     "stt_python": "",
     "stt_sidecar": "",
@@ -659,6 +660,7 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "delete_original_after_cut": "delete_original_after_cut",
     "auto_prepare_latest": "auto_prepare_latest",
     "gemini_model": "gemini_model",
+    "opencode_fallback": "opencode_fallback",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",
     "stt_model": "stt_model",

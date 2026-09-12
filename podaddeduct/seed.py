@@ -11,19 +11,17 @@ import numpy as np
 
 from .config import settings
 from .intervals import Interval, merge_intervals
-from .stt import chunk_transcript_lines
+from .stt import format_timestamped_transcript
 
 logger = logging.getLogger("podaddeduct.seed")
 
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
-GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
-GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
+GEMINI_FALLBACK_MODEL = "gemini-2.0-flash"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MAX_TRIES = 5
 GEMINI_MAX_OUTPUT_TOKENS = 8192
-# ~15 min of dense transcript text per chunk; overlapping windows for long shows.
-GEMINI_CHUNK_MAX_CHARS = 12000
 
 # MinusPod-style boundary defaults.
 EARLY_AD_SNAP_SECONDS = 30.0
@@ -110,21 +108,29 @@ SYSTEM_PROMPT = """You mark podcast advertisements for cutting.
 Given a timestamped transcript ([start-end] text per line), return ONLY a JSON array of
 objects {"start": <seconds>, "end": <seconds>} for every ad segment.
 
-WHAT TO MARK (these ARE ads):
-- Dynamic ad inserts / mid-rolls / pre-rolls / post-rolls
-- Host-read sponsor reads ("brought to you by", "presented by", "this episode is sponsored by", promo codes, etc.)
-- Network promo blocks and platform bookends (Acast, Megaphone, iHeart, Spotify for Podcasters, etc.)
-- Short brand tagline ads (15-45s) that sound like radio commercials even without promo codes/URLs
-- Sportsbook / gambling sponsor reads AND their legal disclaimers (FanDuel, DraftKings, BetMGM, 1-800-GAMBLER, "gambling problem", "must be 21")
-- Post-signoff promotional content after the episode's natural ending (host wrap-up sponsor reads through the end of the transcript)
+DETECTION VECTORS (what to look for):
+1. SEMANTIC SHIFT:
+   Watch for sudden departures from the main episode topic into universal commercial themes (e.g.
+   health, athletic greens, meal delivery, therapy, VPNs, web hosting, hiring, mattresses,
+   insurance, sports betting, financial apps, security).
+2. DISCLAIMERS & PROMO CODES:
+   Flag phrases like "Go to [URL] and use code...", "visit [URL]", "promo code", "discount code",
+   "at checkout", "Thanks to our sponsor...", "Support for this podcast comes from...",
+   or legal disclaimers like "Must be 21 or older", "gambling problem call 1-800-GAMBLER",
+   "terms and conditions apply".
+3. DYNAMIC & PLATFORM INSERTS:
+   Pre-rolls, mid-rolls, post-rolls, and network promos/station IDs (Acast, Megaphone, iHeart,
+   Spotify for Podcasters, Wondery) that sound like radio commercials.
 
 BOUNDARY RULES (critical — leftover tails are failures):
-- AD START: Include the transition INTO the ad ("let's take a break", "a word from our sponsors", "brought to you by", "before we get into it"), not just the pitch.
+- AD START: Include the transition INTO the ad ("let's take a break", "a word from our sponsors",
+  "brought to you by", "before we get into it", "first let me tell you about"), not just the pitch.
 - AD END: The ad ends when SHOW CONTENT resumes, NOT when the pitch ends. Wait for:
   - Topic change back to episode content
   - Host says "anyway", "alright", "all right", "so", "back to the show" and changes subject
   - AFTER the final URL / promo code mention (they often repeat it)
-- For post-rolls: mark from the first promotional word through the LAST promotional / disclaimer word (extend to the end of the transcript if the episode ends on ads).
+- POST-ROLLS: Mark from the first promotional word through the LAST promotional / disclaimer
+  word (extend through the end of the transcript if the episode ends on ads).
 - Merge contiguous / near-contiguous ad sentences into one range (gaps under ~15 seconds of filler).
 - Use the transcript timestamps exactly.
 
@@ -133,7 +139,8 @@ WHAT NOT TO MARK:
 - A guest discussing their own work in an interview
 - The host organically mentioning their own other shows / Patreon mid-conversation (not a produced promo block)
 
-Return [] if there are no ads. No markdown, no commentary — JSON array only."""
+STRUCTURED OUTPUT:
+Return [] if there are no ads. No markdown explanation, no commentary — JSON array only."""
 
 
 def resolve_gemini_api_key() -> str | None:
@@ -254,6 +261,12 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
                         texts = [str(parts[-1].get("text") or "")]
                     return "\n".join(t for t in texts if t).strip()
                 last_err = f"{resp.status_code} {resp.text[:300]}"
+                # Quota exhaustion (daily cap / billing limit) cannot be fixed by sleeping a few seconds.
+                # Fail immediately instead of wasting time and burning repeated calls.
+                if resp.status_code == 429 and any(
+                    k in resp.text.lower() for k in ("quota", "resource_exhausted")
+                ):
+                    raise RuntimeError(f"Gemini quota exceeded: {last_err}")
                 if resp.status_code not in (408, 425, 429, 500, 502, 503, 504):
                     raise httpx.HTTPStatusError(
                         last_err, request=resp.request, response=resp
@@ -270,13 +283,108 @@ def _gemini_generate(api_key: str, model: str, user_content: str) -> str:
     raise RuntimeError(f"Gemini failed after {GEMINI_MAX_TRIES} tries: {last_err}")
 
 
+OPENCODE_DEFAULT_MODELS = [
+    "opencode/kimi-k2.5",
+    "opencode/minimax-m2.5",
+    "opencode/mimo-v2.5-free",
+    "opencode/nemotron-3.5-lightning-free",
+]
+
+
+def get_opencode_bin() -> str | None:
+    """Find opencode CLI binary in PATH or standard user install locations."""
+    import os
+    import shutil
+
+    b = shutil.which("opencode")
+    if b:
+        return b
+    home_bin = os.path.expanduser("~/.opencode/bin/opencode")
+    if os.path.isfile(home_bin) and os.access(home_bin, os.X_OK):
+        return home_bin
+    return None
+
+
+def is_opencode_available() -> bool:
+    return get_opencode_bin() is not None
+
+
+def opencode_generate(prompt: str, model: str | None = None) -> str:
+    """Invoke opencode CLI runner to generate JSON response."""
+    import subprocess
+
+    bin_path = get_opencode_bin()
+    if not bin_path:
+        raise RuntimeError("opencode CLI not found in PATH")
+
+    models_to_try = [model.strip()] if (model or "").strip() else list(OPENCODE_DEFAULT_MODELS)
+    last_err = ""
+
+    for m in models_to_try:
+        cmd = [bin_path, "run", prompt, "-m", m, "--pure"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            last_err = f"opencode timed out after 180s on {m}"
+            logger.warning(last_err)
+            continue
+        if proc.returncode == 0:
+            return proc.stdout
+        err_msg = (proc.stderr or proc.stdout or "").strip()
+        last_err = f"{m} failed ({proc.returncode}): {err_msg[:200]}"
+        if any(w in err_msg.lower() for w in ("insufficient balance", "creditserror", "unauthorized")):
+            logger.warning("opencode %s credits unavailable; trying next model", m)
+            continue
+        logger.warning("opencode attempt failed: %s", last_err)
+
+    raise RuntimeError(f"opencode failed: {last_err}")
+
+
+def find_ads_with_opencode(transcript: dict, model: str | None = None) -> AdDetectionResult:
+    """Run ad detection via opencode CLI on full transcript."""
+    body = format_timestamped_transcript(transcript)
+    if not body.strip():
+        return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
+
+    user = (
+        "Return JSON array of ad ranges for this podcast transcript. "
+        "Timestamps are in seconds [start-end].\n\n"
+        f"{body}"
+    )
+    prompt = SYSTEM_PROMPT + "\n\n" + user
+    try:
+        raw = opencode_generate(prompt, model=model)
+        parsed = _extract_json_array(raw)
+        logger.info("opencode ad detection -> %d ranges", len(parsed))
+        ranges = merge_intervals(
+            [Interval(float(r["start"]), float(r["end"])) for r in parsed],
+            gap=NEARBY_AD_GAP_SECONDS,
+        )
+        return AdDetectionResult(ranges=ranges, gemini_error=None, gemini_ok=True)
+    except Exception as exc:
+        logger.warning("opencode ad detection failed: %s", exc)
+        return AdDetectionResult(ranges=[], gemini_error=str(exc)[-300:], gemini_ok=False)
+
+
 def test_gemini_connection(model: str | None = None) -> dict:
     """Send one tiny request to prove key + model work. Never raises."""
     try:
+        use_model = (model or "").strip() or gemini_model()
+        if use_model.startswith("opencode") or (not resolve_gemini_api_key() and is_opencode_available()):
+            start = time.monotonic()
+            raw = opencode_generate("Return strictly JSON: []", model=use_model if use_model.startswith("opencode") else None)
+            parsed = _extract_json_array(raw)
+            ms = int((time.monotonic() - start) * 1000)
+            return {
+                "ok": True,
+                "provider": "opencode",
+                "model": use_model,
+                "ms": ms,
+                "ranges": len(parsed),
+            }
         api_key = resolve_gemini_api_key()
         if not api_key:
             return {"ok": False, "error": "No Gemini API key saved yet."}
-        use_model = (model or "").strip() or gemini_model()
         start = time.monotonic()
         raw = _gemini_generate(api_key, use_model, "Return exactly: []")
         parsed = _extract_json_array(raw)
@@ -349,91 +457,87 @@ def leftover_transcript(transcript: dict, covered: list[Interval]) -> dict:
 
 
 def find_ads_with_gemini(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """Gemini ad detection on chunked transcript. Soft-fails with gemini_error set."""
+    """One-shot AI ad detection on full transcript using Gemini or OpenCode CLI."""
+    model = gemini_model()
+    if model.startswith("opencode"):
+        if progress_cb is not None:
+            progress_cb(0, 1)
+        res = find_ads_with_opencode(transcript, model=model)
+        if progress_cb is not None:
+            progress_cb(1, 1)
+        return res
+
     api_key = resolve_gemini_api_key()
     if not api_key:
         logger.info("No Gemini API key; skipping LLM ad detection")
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=False)
 
-    chunks = chunk_transcript_lines(transcript, max_chars=GEMINI_CHUNK_MAX_CHARS)
-    if not chunks:
+    body = format_timestamped_transcript(transcript)
+    if not body.strip():
         return AdDetectionResult(ranges=[], gemini_error=None, gemini_ok=True)
 
-    model = gemini_model()
-    total = len(chunks)
-    all_parsed: list[dict] = []
+    user = (
+        "Return JSON array of ad ranges for this podcast transcript. "
+        "Timestamps are in seconds [start-end].\n\n"
+        f"{body}"
+    )
     last_err: str | None = None
-    any_ok = False
+    parsed: list[dict] = []
 
     if progress_cb is not None:
-        progress_cb(0, total)
+        progress_cb(0, 1)
 
-    for i, body in enumerate(chunks):
-        user = (
-            "Return JSON array of ad ranges for this transcript chunk "
-            f"({i + 1} of {total}). Timestamps are absolute episode seconds.\n\n"
-            f"{body}"
-        )
-        try:
-            raw = _gemini_generate(api_key, model, user)
-            parsed = _extract_json_array(raw)
-            logger.info("gemini %s chunk %d/%d -> %d ranges", model, i + 1, total, len(parsed))
-            all_parsed.extend(parsed)
-            any_ok = True
-        except Exception as primary_exc:
-            fallback = GEMINI_FALLBACK_MODEL
-            err_text = str(primary_exc)
-            if model != fallback and ("503" in err_text or "429" in err_text or "high demand" in err_text.lower()):
-                logger.warning(
-                    "Gemini %s chunk %d failed (%s); trying fallback %s",
-                    model,
-                    i + 1,
-                    primary_exc,
-                    fallback,
-                )
-                try:
-                    raw = _gemini_generate(api_key, fallback, user)
-                    parsed = _extract_json_array(raw)
-                    logger.info(
-                        "gemini fallback %s chunk %d/%d -> %d ranges",
-                        fallback,
-                        i + 1,
-                        total,
-                        len(parsed),
-                    )
-                    all_parsed.extend(parsed)
-                    any_ok = True
-                except Exception as fallback_exc:
-                    last_err = str(fallback_exc)[-300:]
-                    logger.warning(
-                        "Gemini ad detection chunk %d failed: %s",
-                        i + 1,
-                        fallback_exc,
-                    )
-            else:
-                last_err = err_text[-300:]
-                logger.warning(
-                    "Gemini ad detection chunk %d failed: %s",
-                    i + 1,
-                    primary_exc,
-                )
-        if progress_cb is not None:
-            progress_cb(i + 1, total)
+    try:
+        raw = _gemini_generate(api_key, model, user)
+        parsed = _extract_json_array(raw)
+        logger.info("gemini %s -> %d ranges", model, len(parsed))
+    except Exception as primary_exc:
+        fallback = GEMINI_FALLBACK_MODEL
+        err_text = str(primary_exc)
+        if model != fallback and ("503" in err_text or "429" in err_text or "high demand" in err_text.lower() or "quota" in err_text.lower()):
+            logger.warning(
+                "Gemini %s failed (%s); trying fallback %s",
+                model,
+                primary_exc,
+                fallback,
+            )
+            try:
+                raw = _gemini_generate(api_key, fallback, user)
+                parsed = _extract_json_array(raw)
+                logger.info("gemini fallback %s -> %d ranges", fallback, len(parsed))
+            except Exception as fallback_exc:
+                last_err = str(fallback_exc)[-300:]
+                logger.warning("Gemini fallback %s failed: %s", fallback, fallback_exc)
+        else:
+            last_err = err_text[-300:]
+            logger.warning("Gemini ad detection failed: %s", primary_exc)
+
+        # If Gemini quota exceeded or failed completely, fall back to OpenCode CLI if enabled
+        from . import db as _db
+
+        if not parsed and (settings.opencode_fallback or _db.runtime_bool("opencode_fallback")) and is_opencode_available():
+            logger.warning("Gemini failed (%s); attempting OpenCode CLI backup", last_err)
+            opencode_res = find_ads_with_opencode(transcript)
+            if opencode_res.gemini_ok:
+                if progress_cb is not None:
+                    progress_cb(1, 1)
+                return opencode_res
+
+    if progress_cb is not None:
+        progress_cb(1, 1)
+
+    if last_err and not parsed:
+        return AdDetectionResult(ranges=[], gemini_error=last_err, gemini_ok=False)
 
     ranges = merge_intervals(
-        [Interval(float(r["start"]), float(r["end"])) for r in all_parsed],
+        [Interval(float(r["start"]), float(r["end"])) for r in parsed],
         gap=NEARBY_AD_GAP_SECONDS,
     )
-    if not any_ok and last_err:
-        return AdDetectionResult(ranges=[], gemini_error=last_err, gemini_ok=False)
-    if last_err and any_ok:
-        # Partial success — keep ranges, note the warning.
-        return AdDetectionResult(ranges=ranges, gemini_error=last_err, gemini_ok=True)
-    return AdDetectionResult(ranges=ranges, gemini_error=None, gemini_ok=True)
+    return AdDetectionResult(ranges=ranges, gemini_error=last_err, gemini_ok=True)
 
 
 def find_ads_with_zen(transcript: dict, progress_cb=None) -> AdDetectionResult:
-    """Heuristics + Gemini on chunked transcript (MinusPod-style). Name kept for call sites."""
+    """Heuristics + Gemini on full transcript (MinusPod-style). Name kept for call sites."""
     heur = heuristic_ads(transcript)
     llm = find_ads_with_gemini(transcript, progress_cb=progress_cb)
     # When Gemini failed entirely, do not keep isolated heuristic micro-cuts —

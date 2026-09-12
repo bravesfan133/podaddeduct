@@ -64,7 +64,7 @@
       <form method="post" action="/settings/global">
         <input type="hidden" name="settings_form" value="1" />
         <div class="row">
-          <div><label>Gemini model</label><input name="gemini_model" type="text" value="{{ global_settings.gemini_model }}" placeholder="{{ effective.gemini_model or 'gemini-3.6-flash' }}" /></div>
+          <div><label>Gemini model</label><input name="gemini_model" type="text" value="{{ global_settings.gemini_model }}" placeholder="{{ effective.gemini_model or 'gemini-3.5-flash' }}" /></div>
         </div>
         <button type="submit">Save model</button>
       </form>

@@ -35,7 +35,7 @@ Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
 2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
-3. Cheap **sponsor-read heuristics**, then **Google Gemini Direct** (`gemini-3.6-flash`, free AI Studio tier) on leftover spans in one shot.
+3. Cheap **sponsor-read heuristics**, then **Google Gemini Direct** (`gemini-3.5-flash`, free AI Studio tier) in one shot.
 4. Snap to silence, cut with ffmpeg (ID3 tags and cover art preserved).
 
 Everything is configured in **Settings** — no config files needed:
