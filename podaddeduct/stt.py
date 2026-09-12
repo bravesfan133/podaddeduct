@@ -128,8 +128,18 @@ def backend_status() -> dict:
     }
 
 
-def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> dict:
-    """Run the configured STT sidecar (or return cached transcript)."""
+def transcribe_audio(
+    audio_path: Path,
+    dest: Path,
+    *,
+    force: bool = False,
+    progress_cb=None,
+) -> dict:
+    """Run the configured STT sidecar (or return cached transcript).
+
+    progress_cb(stage: str, detail: str = "") is called for each `STAGE …`
+    line the sidecar prints (e.g. encoding / waiting_groq / done).
+    """
     if dest.exists() and not force:
         cached = load_transcript(dest)
         if cached and cached.get("sentences") is not None:
@@ -163,19 +173,38 @@ def transcribe_audio(audio_path: Path, dest: Path, *, force: bool = False) -> di
     groq_key = get_groq_api_key()
     if groq_key and "GROQ_API_KEY" not in env:
         env["GROQ_API_KEY"] = groq_key
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
         env=env,
+        bufsize=1,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"STT failed ({proc.returncode}): {proc.stderr[-2000:] or proc.stdout[-2000:]}"
-        )
-    if proc.stdout:
-        logger.info("STT: %s", proc.stdout.strip()[-500:])
+    out_lines: list[str] = []
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        out_lines.append(line)
+        if not line.startswith("STAGE "):
+            continue
+        parts = line.split()
+        # STAGE encoding 1/3  |  STAGE waiting_groq 1/3  |  STAGE done
+        if len(parts) < 2:
+            continue
+        stage = parts[1]
+        detail = parts[2] if len(parts) > 2 else ""
+        if progress_cb is not None:
+            try:
+                progress_cb(stage, detail)
+            except Exception:
+                logger.exception("STT progress_cb failed")
+    rc = proc.wait()
+    combined = "\n".join(out_lines)
+    if rc != 0:
+        raise RuntimeError(f"STT failed ({rc}): {combined[-2000:]}")
+    if combined:
+        logger.info("STT: %s", combined.strip()[-500:])
     data = load_transcript(dest)
     if not data:
         raise RuntimeError(f"STT produced no transcript at {dest}")

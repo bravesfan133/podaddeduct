@@ -8,9 +8,9 @@ Model is a Groq Whisper id (default whisper-large-v3-turbo).
 API key comes from the GROQ_API_KEY environment variable (injected by the
 app from Settings → Server, so no .env needed).
 
-Groq caps uploads at 25MB (free tier), so long episodes are compressed to
-16kHz mono and split into overlapping chunks, transcribed independently,
-then merged with timestamps offset back. Overlap duplicates are dropped.
+Groq caps uploads at 25MB. Files under 24 MB are posted as-is (no ffmpeg).
+Larger episodes are compressed to 16kHz mono and split into overlapping
+chunks with ffmpeg -threads 1, transcribed independently, then merged.
 """
 from __future__ import annotations
 
@@ -27,16 +27,38 @@ import httpx
 
 API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_MODEL = "whisper-large-v3-turbo"
+# Stay under Groq's 25 MB hard cap with headroom for metadata.
+UPLOAD_AS_IS_MAX_BYTES = 24 * 1024 * 1024
 # 48kbps mono ≈ 6KB/s → 20MB holds ~55min; overlap absorbs cut edges.
 CHUNK_TARGET_MB = 20
 CHUNK_BITRATE_KBPS = 48
 OVERLAP_S = 15.0
 MAX_TRIES = 5
 
+_MIME = {
+    ".mp3": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+}
+
 
 def fail(msg: str) -> NoReturn:
     print(f"stt_groq: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def stage(name: str, detail: str = "") -> None:
+    """Parseable progress for the parent process (stdout)."""
+    line = f"STAGE {name}"
+    if detail:
+        line = f"{line} {detail}"
+    print(line, flush=True)
 
 
 def probe_duration(audio: Path) -> float:
@@ -70,13 +92,22 @@ def plan_chunks(duration_s: float, target_mb: float = CHUNK_TARGET_MB,
 
 def split_chunk(src: Path, start: float, length: float, dest: Path) -> None:
     proc = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
-         "-i", str(src), "-ar", "16000", "-ac", "1", "-b:a", f"{CHUNK_BITRATE_KBPS}k",
-         str(dest)],
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-threads", "1",
+            "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
+            "-i", str(src),
+            "-ar", "16000", "-ac", "1", "-b:a", f"{CHUNK_BITRATE_KBPS}k",
+            str(dest),
+        ],
         capture_output=True, text=True, check=False,
     )
     if proc.returncode != 0 or not dest.exists():
         fail(f"ffmpeg split failed: {(proc.stderr or '')[-500:]}")
+
+
+def _content_type(path: Path) -> str:
+    return _MIME.get(path.suffix.lower(), "audio/mpeg")
 
 
 def transcribe_chunk(client: httpx.Client, key: str, path: Path, model: str) -> list[dict]:
@@ -90,7 +121,7 @@ def transcribe_chunk(client: httpx.Client, key: str, path: Path, model: str) -> 
                 resp = client.post(
                     API_URL,
                     headers={"Authorization": f"Bearer {key}"},
-                    files={"file": (path.name, f, "audio/mpeg")},
+                    files={"file": (path.name, f, _content_type(path))},
                     data={"model": model, "response_format": "verbose_json",
                           "timestamp_granularities[]": "segment", "temperature": "0"},
                 )
@@ -150,6 +181,17 @@ def merge_segments(chunked: list[tuple[float, list[dict]]]) -> list[dict]:
     return out
 
 
+def _write_dest(dest: Path, sentences: list[dict], model: str) -> None:
+    if not sentences:
+        fail("Groq returned no transcript segments.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps({"sentences": sentences, "source": "groq", "model": model}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"stt_groq: {len(sentences)} sentences -> {dest}")
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         print("usage: stt_groq.py <audio> <dest.json> [model]", file=sys.stderr)
@@ -163,31 +205,43 @@ def main() -> None:
     if not audio.exists():
         fail(f"audio not found: {audio}")
 
+    size = audio.stat().st_size
+    # Under 24 MB: upload original once — no ffmpeg re-encode/split.
+    if size <= UPLOAD_AS_IS_MAX_BYTES:
+        print(f"stt_groq: {size / (1024 * 1024):.1f}MB fits upload cap — no ffmpeg", flush=True)
+        stage("waiting_groq", "1/1")
+        with httpx.Client(timeout=600.0) as client:
+            segs = transcribe_chunk(client, key, audio, model)
+        stage("done")
+        _write_dest(dest, [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in segs], model)
+        return
+
     duration = probe_duration(audio)
     if duration <= 0:
         fail("could not read audio duration (is ffmpeg/ffprobe installed?).")
     chunks = plan_chunks(duration)
-    print(f"stt_groq: {duration / 60:.1f}min audio → {len(chunks)} chunk(s), model={model}")
+    print(
+        f"stt_groq: {size / (1024 * 1024):.1f}MB / {duration / 60:.1f}min → "
+        f"{len(chunks)} chunk(s), model={model}",
+        flush=True,
+    )
 
     results: list[tuple[float, list[dict]]] = []
+    n = len(chunks)
     with httpx.Client(timeout=600.0) as client:
         with tempfile.TemporaryDirectory(prefix="groq-chunks-") as tmp:
             for i, (start, length) in enumerate(chunks):
+                detail = f"{i + 1}/{n}"
+                stage("encoding", detail)
                 cpath = Path(tmp) / f"chunk-{i:03d}.mp3"
                 split_chunk(audio, start, length, cpath)
+                stage("waiting_groq", detail)
                 segs = transcribe_chunk(client, key, cpath, model)
-                print(f"stt_groq: chunk {i + 1}/{len(chunks)} → {len(segs)} segments")
+                print(f"stt_groq: chunk {i + 1}/{n} → {len(segs)} segments", flush=True)
                 results.append((start, segs))
 
-    sentences = merge_segments(results)
-    if not sentences:
-        fail("Groq returned no transcript segments.")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(
-        json.dumps({"sentences": sentences, "source": "groq", "model": model}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"stt_groq: {len(sentences)} sentences -> {dest}")
+    stage("done")
+    _write_dest(dest, merge_segments(results), model)
 
 
 if __name__ == "__main__":

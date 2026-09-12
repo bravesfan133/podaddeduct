@@ -142,7 +142,14 @@ def test_job_tracker_and_describe():
         proc._job_stage("downloading", "45/210 MB")
         assert proc.describe_job() == "Downloading… 45/210 MB"
         proc._job_stage("transcribing")
-        assert "Transcribing" in proc.describe_job()
+        assert "Waiting on Groq" in proc.describe_job()
+        proc._job_stage("encoding", "1/2")
+        assert "Compressing audio for Groq" in proc.describe_job()
+        assert "1/2" in proc.describe_job()
+        proc._job_stage("waiting_groq", "2/2")
+        assert "Waiting on Groq" in proc.describe_job()
+        proc._job_stage("detecting")
+        assert proc.describe_job() == "Waiting on Gemini…"
         st = proc.worker_state()
         assert st["current"]["episode_id"] == 7
         assert st["current"]["elapsed"] >= 0
@@ -178,7 +185,7 @@ def test_status_reports_live_job(tmp_path, monkeypatch):
     try:
         with TestClient(app) as client:
             body = client.get(f"/api/episodes/{ep.id}/status").json()
-            assert "Transcribing" in body["job_text"]
+            assert "Waiting on Groq" in body["job_text"]
             assert body["queue_position"] is None
     finally:
         proc._current = old
@@ -360,7 +367,7 @@ def test_get_queue_details_idle_and_queued(tmp_path, monkeypatch):
         assert details["current"]["feed_title"] == "Show One"
         assert details["current"]["feed_slug"] == "q1"
         assert details["current"]["stage"] == "transcribing"
-        assert details["current"]["stage_label"] == "Transcribing"
+        assert details["current"]["stage_label"] == "Waiting on Groq"
         assert details["current"]["percent"] is None  # indeterminate
         assert details["queue_depth"] == 1
         assert details["queued"][0]["episode_id"] == ep2.id

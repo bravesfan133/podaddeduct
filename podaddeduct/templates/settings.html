@@ -49,7 +49,7 @@
 
   <div class="card">
     <h2>Ad detection</h2>
-    <p class="sub">One Gemini pass over the full transcript finds host-reads. Repeated inserted spots are matched with chromaprint fingerprints after the first successful cut. Caps refuse unsafe “wipe the episode” marks.</p>
+    <p class="sub">One Gemini pass over the full transcript finds host-reads and inserts. Caps refuse unsafe “wipe the episode” marks.</p>
     {% if saved == 'gemini' %}<p class="ok">Gemini key saved.</p>{% endif %}
     <form method="post" action="/settings/gemini-key">
       <label>Gemini API key {% if gemini.configured %}<span class="ok">(saved via {{ gemini.source }})</span>{% endif %}</label>

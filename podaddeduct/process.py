@@ -38,9 +38,10 @@ _recent_completed: deque[dict] = deque(maxlen=5)
 _STAGE_LABELS = {
     "queued": "Waiting",
     "downloading": "Downloading",
-    "matching": "Matching inserts",
-    "transcribing": "Transcribing",
-    "detecting": "Labeling ads",
+    "encoding": "Compressing for Groq",
+    "waiting_groq": "Waiting on Groq",
+    "transcribing": "Waiting on Groq",
+    "detecting": "Waiting on Gemini",
     "cutting": "Cutting",
     "finishing": "Finishing",
 }
@@ -58,7 +59,7 @@ def _job_stage(stage: str, detail: str = "") -> None:
         _current["detail"] = detail
         _current["started_at"] = time.monotonic()
         # Keep progress counters only for stages that report fine-grained progress.
-        if stage not in ("detecting", "downloading"):
+        if stage not in ("detecting", "downloading", "encoding", "waiting_groq"):
             _current["done"] = None
             _current["total"] = None
 
@@ -115,12 +116,12 @@ def describe_job(job: dict | None = None) -> str:
         return "Waiting in line…"
     if stage == "downloading":
         return f"Downloading… {detail}" if detail else "Downloading…"
-    if stage == "matching":
-        return "Matching known ad inserts…"
-    if stage == "transcribing":
-        return "Transcribing speech…"
+    if stage == "encoding":
+        return f"Compressing audio for Groq… {detail}".rstrip() if detail else "Compressing audio for Groq…"
+    if stage in ("waiting_groq", "transcribing"):
+        return f"Waiting on Groq… {detail}".rstrip() if detail else "Waiting on Groq…"
     if stage == "detecting":
-        return "Finding ads (one Gemini pass)…"
+        return "Waiting on Gemini…"
     if stage == "cutting":
         return "Cutting clean file…"
     if stage == "finishing":
@@ -436,19 +437,27 @@ def _recut_saved(episode_id: int, audio_path: Path, saved: list[dict]) -> None:
     _finalize(episode_id, audio_path, duration, ads)
 
 
+def _stt_stage_cb(episode_id: int, stage: str, detail: str = "") -> None:
+    """Map STT sidecar STAGE lines into live queue / episode status."""
+    if stage == "encoding":
+        _job_stage("encoding", detail)
+        db.update_episode(episode_id, status="working", error="Compressing audio for Groq…")
+    elif stage == "waiting_groq":
+        _job_stage("waiting_groq", detail)
+        db.update_episode(episode_id, status="working", error="Waiting on Groq…")
+    elif stage == "done":
+        return
+
+
 def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     from .chapters import try_publisher_chapters
-    from .fingerprint import match_ads_in_episode
-    from .intervals import merge_intervals
-    from .seed import union_ranges
 
     t_all = time.monotonic()
     logger.info("episode %s detecting ads", episode_id)
-    db.update_episode(episode_id, status="working", error="Matching inserts…")
+    db.update_episode(episode_id, status="working", error="Probing audio…")
 
     duration = probe_duration(audio_path)
     if duration <= 0:
-        _job_stage("matching")
         pcm, sr = load_mono_pcm(audio_path)
         duration = len(pcm) / float(sr)
 
@@ -471,21 +480,9 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         )
         return
 
-    # 2) Chromaprint match known inserts from this show (no Gemini).
-    fp_hits: list[Interval] = []
-    if ep is not None:
-        _job_stage("matching")
-        try:
-            fp_hits = match_ads_in_episode(ep.feed_id, audio_path, duration)
-            if fp_hits:
-                sources.append("fingerprint")
-                logger.info("episode %s fingerprint matched %d ranges", episode_id, len(fp_hits))
-        except Exception:
-            logger.exception("fingerprint match failed for episode %s", episode_id)
-
-    # 3) Transcript → one Gemini pass on the full transcript.
-    db.update_episode(episode_id, status="working", error="Transcribing…")
-    _job_stage("transcribing")
+    # 2) Transcript → one Gemini pass on the full transcript.
+    db.update_episode(episode_id, status="working", error="Waiting on Groq…")
+    _job_stage("waiting_groq")
     t0 = time.monotonic()
     transcript = None
     if ep is not None:
@@ -500,12 +497,17 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
             except OSError:
                 logger.warning("episode %s could not cache publisher transcript", episode_id)
     if transcript is None:
-        transcript = transcribe_audio(audio_path, transcript_path_for(episode_id), force=False)
+        transcript = transcribe_audio(
+            audio_path,
+            transcript_path_for(episode_id),
+            force=False,
+            progress_cb=lambda stage, detail="": _stt_stage_cb(episode_id, stage, detail),
+        )
         transcript.setdefault("source", "local")
     n_sent = len((transcript.get("sentences") or []))
     logger.info("episode %s transcribed %d sentences in %.0fs", episode_id, n_sent, time.monotonic() - t0)
 
-    db.update_episode(episode_id, status="working", error="Labeling ads…")
+    db.update_episode(episode_id, status="working", error="Waiting on Gemini…")
     _job_stage("detecting")
     t0 = time.monotonic()
     detection = find_ads_with_zen(transcript, progress_cb=_job_progress)
@@ -520,8 +522,7 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
         detection.gemini_ok,
     )
 
-    merged = union_ranges(fp_hits, detected)
-    ads = snap_edges_windowed(merged, audio_path, duration, window=snap_win)
+    ads = snap_edges_windowed(detected, audio_path, duration, window=snap_win)
     ads = filter_min_duration(ads, min_seconds=effective_min_ad_seconds())
     ads = filter_max_duration(ads, duration=duration)
 
@@ -547,7 +548,6 @@ def _finalize(
     sources: list[str] | None = None,
 ) -> None:
     from .chapters import intervals_to_dicts
-    from .fingerprint import store_ad_fingerprints
 
     _job_stage("finishing")
     guard = evaluate_cut_guards(ads, duration)
@@ -586,13 +586,6 @@ def _finalize(
         try:
             _job_stage("cutting")
             t0 = time.monotonic()
-            # Store fingerprints from original BEFORE optional delete.
-            ep = db.get_episode(episode_id)
-            if ep is not None:
-                try:
-                    store_ad_fingerprints(ep.feed_id, episode_id, audio_path, ads)
-                except Exception:
-                    logger.exception("fingerprint store failed for episode %s", episode_id)
             cut_ads(audio_path, ads, clean_path, duration=duration)
             logger.info("episode %s ffmpeg cut done in %.0fs", episode_id, time.monotonic() - t0)
             fields["clean_audio_path"] = str(clean_path)

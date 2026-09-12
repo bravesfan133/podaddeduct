@@ -33,10 +33,9 @@ Podcast-app refresh checks (`HEAD`) never start work. The custom RSS lists **Rea
 Cheapest path first:
 
 1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
-2. **Chromaprint fingerprints** of ads cut on earlier episodes of the same show (inserted spots).
-3. **Publisher transcript** in the RSS (free) → else Groq Whisper (Docker) / Parakeet (Mac).
-4. **One Gemini `generateContent` call** on the full transcript (host-reads + missed inserts). Temperature 0.2; server-side max span (~3 min midrolls) and coverage guards refuse unsafe cuts.
-5. Snap edges near transcript times / short silence windows, cut with ffmpeg (`-threads 1`; stream-copy when the source is already MP3).
+2. **Publisher transcript** in the RSS (free) → else Groq Whisper (Docker) / Parakeet (Mac). Files under 24 MB upload as-is; larger ones get a single-thread ffmpeg compress first.
+3. **One Gemini `generateContent` call** on the full transcript (host-reads + inserts). Temperature 0.2; server-side max span (~3 min midrolls) and coverage guards refuse unsafe cuts.
+4. Snap edges near transcript times / short silence windows, cut with ffmpeg (`-threads 1`; stream-copy when the source is already MP3).
 
 Everything is configured in **Settings**:
 
@@ -54,7 +53,7 @@ docker compose up -d --build
 
 Data (DB, audio, transcripts) lives in the `podaddeduct-data` volume. The app serves port **7887**: point your Cloudflare Tunnel hostname at `http://localhost:7887` (tunnel on the same machine) and set that `https://…` URL as the public address in Settings.
 
-Compose passes through the N100 iGPU (`/dev/dri`, `LIBVA_DRIVER_NAME=iHD`) so ffmpeg can use **VAAPI decode** when the codec allows. Device passthrough is enough (the container runs as root). Chromaprint (`fpcalc`), Groq, Gemini, and MP3 encoding stay on CPU — Quick Sync does not encode MP3. Idle process list should be uvicorn only (no OpenCode). If `/dev/dri` is missing on the host, Compose will fail on `devices` and VAAPI stays off.
+Compose passes through the N100 iGPU (`/dev/dri`, `LIBVA_DRIVER_NAME=iHD`) so ffmpeg can use **VAAPI decode** when the codec allows. Device passthrough is enough (the container runs as root). Groq/Gemini wait on the network; residual local CPU is ffmpeg only when a file exceeds Groq’s upload cap (and Quick Sync does not encode MP3). Idle process list should be uvicorn only. If `/dev/dri` is missing on the host, Compose will fail on `devices` and VAAPI stays off.
 
 ## Outside home Wi-Fi / Overcast
 

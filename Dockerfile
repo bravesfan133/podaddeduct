@@ -4,7 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
-    libchromaprint-tools \
     vainfo \
     intel-media-va-driver \
     libva2 \
