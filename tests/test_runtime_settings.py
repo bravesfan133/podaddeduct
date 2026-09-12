@@ -26,11 +26,11 @@ def test_kv_overrides_env_default(tmp_path, monkeypatch):
 
 def test_runtime_coercion(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    assert db.runtime_bool("auto_prepare_latest") is True
+    assert db.runtime_bool("delete_original_after_cut") is True
     assert db.runtime_int("process_recent", minimum=1) == settings.process_recent
     assert db.runtime_float("min_ad_seconds", minimum=1.0) == settings.min_ad_seconds
-    db.set_global_settings({"auto_prepare_latest": "false", "process_recent": "7"})
-    assert db.runtime_bool("auto_prepare_latest") is False
+    db.set_global_settings({"delete_original_after_cut": "false", "process_recent": "7"})
+    assert db.runtime_bool("delete_original_after_cut") is False
     assert db.runtime_int("process_recent", minimum=1) == 7
     db.set_global_settings({"process_recent": "not-a-number"})
     assert db.runtime_int("process_recent", minimum=1) == 1
@@ -57,14 +57,14 @@ def test_global_save_accepts_new_fields(tmp_path, monkeypatch):
             "/settings/global",
             data={"settings_form": "1", "min_ad_seconds": "12", "zen_model": "m1",
                   "public_base_url": "https://podcasts.example.com",
-                  "auto_prepare_latest": "on"},
+                  "delete_original_after_cut": "on"},
             follow_redirects=False,
         )
         assert r.status_code == 303
         assert r.headers["location"].startswith("/settings?saved=settings")
     assert db.runtime_float("min_ad_seconds") == 12.0
     assert db.runtime_str("zen_model") == "m1"
-    assert db.runtime_bool("auto_prepare_latest") is True
+    assert db.runtime_bool("delete_original_after_cut") is True
     assert db.runtime_str("public_base_url") == "https://podcasts.example.com"
 
 
@@ -131,21 +131,11 @@ def test_zen_models_falls_back_without_key(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
-    with (
-        patch.object(seed_mod, "ad_provider", return_value="zen"),
-        patch.object(seed_mod, "resolve_zen_api_key", return_value=None),
-    ):
+    with patch.object(seed_mod, "resolve_zen_api_key", return_value=None):
         out = seed_mod.fetch_zen_models()
     assert out["live"] is False
-    assert "muse-spark-1.3-contributor-free" in out["models"]
-
-    with (
-        patch.object(seed_mod, "ad_provider", return_value="groq"),
-        patch.object(seed_mod, "resolve_ad_api_key", return_value=None),
-    ):
-        out = seed_mod.fetch_zen_models()
-    assert out["live"] is False
-    assert "openai/gpt-oss-120b" in out["models"]
+    assert "big-pickle" in out["models"]
+    assert "mimo-v2.5-free" in out["models"]
 
 
 def test_zen_test_reports_no_key(tmp_path, monkeypatch):
@@ -154,7 +144,6 @@ def test_zen_test_reports_no_key(tmp_path, monkeypatch):
     from podaddeduct.app import app
 
     with (
-        patch.object(seed_mod, "ad_provider", return_value="zen"),
         patch.object(seed_mod, "resolve_zen_api_key", return_value=None),
         TestClient(app) as client,
     ):

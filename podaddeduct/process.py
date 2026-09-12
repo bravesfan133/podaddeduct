@@ -178,12 +178,12 @@ def friendly_error(err: str | None) -> str:
         return "Transcription isn't set up — check Settings → Server."
     if "stt failed" in text or "faster_whisper" in text or "whisper" in text:
         return "Speech-to-text failed — check server logs, then hit Prepare to retry."
-    if "zen" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
-        return "Ad detection needs a valid API key — check Settings → Ad detection."
-    if "groq" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
-        return "Ad detection needs a valid Groq key — check Settings → Server."
-    if "model_not_found" in text or "does not exist" in text:
-        return "That AI model was retired — pick a current one in Settings → Ad detection."
+    if "zen" in text and ("key" in text or "401" in text or "403" in text or "auth" in text or "api key" in text):
+        return "Ad detection needs a valid Zen API key — check Settings → Ad detection."
+    if "opencode" in text and ("key" in text or "401" in text or "403" in text or "auth" in text):
+        return "Ad detection needs a valid Zen API key — check Settings → Ad detection."
+    if "model_not_found" in text or "does not exist" in text or "session" in text:
+        return "That AI model isn't available — pick a free chat model like big-pickle in Settings."
     if "ffmpeg" in text:
         return "Audio cutting failed — check server logs, then hit Prepare to retry."
     if "no space" in text or "errno 28" in text or "disk" in text:
@@ -223,7 +223,7 @@ def _file_size(path: Path | None) -> int:
 
 
 async def process_episode(episode_id: int) -> None:
-    """Download -> STT -> Zen -> snap -> cut -> serve.
+    """Download -> detect ads -> snap -> cut -> serve.
 
     Fast path: if ad marks were saved before (e.g. file was auto-deleted by
     the cache janitor), just re-download and re-cut — no AI cost.
@@ -304,22 +304,36 @@ def _recut_saved(episode_id: int, audio_path: Path, saved: list[dict]) -> None:
 
 def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     t_all = time.monotonic()
-    logger.info("episode %s detecting ads (STT+Zen)", episode_id)
-    db.update_episode(episode_id, status="working", error="Transcribing…")
+    logger.info("episode %s detecting ads", episode_id)
+    db.update_episode(episode_id, status="working", error="Finding ads…")
     _job_stage("decoding")
     pcm, sr = load_mono_pcm(audio_path)
     duration = len(pcm) / float(sr)
 
-    # Per-show mode: "chapters" marks ads without storing a second file.
     ep = db.get_episode(episode_id)
-    feed = db.get_feed(ep.feed_id) if ep else None
-    mode = db.get_feed_settings(feed).get("mode", "cut") if feed else "cut"
 
+    # 1) Publisher chapters with Ad/Sponsor titles — cut, no AI.
+    from .chapters import try_publisher_chapters
+
+    pub_ads = try_publisher_chapters(ep, duration) if ep is not None else None
+    if pub_ads:
+        ads = snap_to_silence(pub_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
+        ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
+        _finalize(episode_id, audio_path, duration, ads)
+        logger.info(
+            "episode %s done via publisher chapters (%d ads, total %.0fs)",
+            episode_id,
+            len(ads),
+            time.monotonic() - t_all,
+        )
+        return
+
+    # 2) Transcript → heuristics → LLM on leftovers.
+    db.update_episode(episode_id, status="working", error="Transcribing…")
     _job_stage("transcribing")
     t0 = time.monotonic()
     transcript = None
     if ep is not None:
-        # Cascade: publisher transcript (free, instant) before any STT.
         from .ptranscript import try_publisher_transcript
 
         transcript = try_publisher_transcript(ep, duration)
@@ -338,26 +352,10 @@ def _detect_and_cut(episode_id: int, audio_path: Path) -> None:
     db.update_episode(episode_id, status="working", error="Finding ads…")
     _job_stage("detecting")
     t0 = time.monotonic()
-    zen_ads = find_ads_with_zen(transcript, progress_cb=_job_progress)
-    logger.info("episode %s ad detection found %d ranges in %.0fs", episode_id, len(zen_ads), time.monotonic() - t0)
-    ads = snap_to_silence(zen_ads, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
+    detected = find_ads_with_zen(transcript, progress_cb=_job_progress)
+    logger.info("episode %s ad detection found %d ranges in %.0fs", episode_id, len(detected), time.monotonic() - t0)
+    ads = snap_to_silence(detected, pcm, sr, window=db.runtime_float("silence_snap_window", minimum=0.0))
     ads = filter_min_duration(ads, min_seconds=max(3.0, db.runtime_float("min_ad_seconds", minimum=1.0) * 0.5))
-
-    if mode == "chapters":
-        from .chapters import intervals_to_dicts
-
-        db.update_episode(
-            episode_id,
-            audio_path=str(audio_path),
-            duration_seconds=duration,
-            ad_ranges_json=json.dumps(intervals_to_dicts(ads)),
-            clean_audio_path=None,
-            size_bytes=_file_size(audio_path),
-            status="ready",
-            error=None,
-        )
-        logger.info("episode %s marked %d ad ranges (chapters-only)", episode_id, len(ads))
-        return
 
     _finalize(episode_id, audio_path, duration, ads)
     logger.info("episode %s done with %d ad ranges (total %.0fs)", episode_id, len(ads), time.monotonic() - t_all)

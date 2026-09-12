@@ -8,6 +8,8 @@ from podaddeduct.intervals import Interval
 from podaddeduct.seed import (
     _extract_json_array,
     filter_min_duration,
+    heuristic_ads,
+    leftover_transcript,
     snap_to_silence,
     union_ranges,
 )
@@ -68,28 +70,27 @@ def test_snap_to_silence_moves_edges():
     assert snapped[0].end > 7.5
 
 
-def test_extract_response_text():
-    from podaddeduct.seed import _extract_response_text
+def test_heuristic_ads_finds_sponsor_reads():
+    ads = heuristic_ads(FIXTURE_TRANSCRIPT)
+    assert len(ads) >= 1
+    assert ads[0].start <= 4.5
+    assert ads[0].end >= 29.0  # merged with "use code" sentence
 
-    assert _extract_response_text({"output_text": '[{"start":1,"end":2}]'}) == '[{"start":1,"end":2}]'
-    nested = {
-        "output": [
-            {
-                "type": "message",
-                "content": [{"type": "output_text", "text": '[{"start":4,"end":30}]'}],
-            }
-        ]
-    }
-    assert _extract_response_text(nested) == '[{"start":4,"end":30}]'
+
+def test_leftover_transcript_drops_covered():
+    covered = [Interval(4.0, 30.0)]
+    left = leftover_transcript(FIXTURE_TRANSCRIPT, covered)
+    texts = [s["text"] for s in left["sentences"]]
+    assert "Welcome to the show." in texts
+    assert "Alright let's talk Braves baseball." in texts
+    assert not any("brought to you" in t for t in texts)
 
 
 def test_find_ads_with_zen_mocked():
     from podaddeduct import db as db_mod
     from podaddeduct import seed as seed_mod
 
-    def fake_responses(provider, api_key, model, user_content):
-        if "Acme" in user_content or "brought to you" in user_content:
-            return '[{"start": 4.0, "end": 30.0}]'
+    def fake_chat(api_key, model, user_content):
         if "Midroll" in user_content or "car commercial" in user_content:
             return '[{"start": 400.0, "end": 445.0}]'
         return "[]"
@@ -102,12 +103,12 @@ def test_find_ads_with_zen_mocked():
         return real_runtime_int(key, **kwargs)
 
     with (
-        patch.object(seed_mod, "ad_provider", return_value="zen"),
         patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
-        patch.object(seed_mod, "_llm_call", side_effect=fake_responses),
+        patch.object(seed_mod, "_chat_completions", side_effect=fake_chat),
         patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
     ):
         ads = seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT)
+    # Heuristic covers the sponsor block; LLM covers midroll leftover.
     assert len(ads) >= 2
     assert ads[0].start <= 4.5
     assert any(a.start >= 390 for a in ads)
@@ -119,7 +120,7 @@ def test_find_ads_progress_callback():
 
     seen = []
 
-    def fake_responses(provider, api_key, model, user_content):
+    def fake_chat(api_key, model, user_content):
         return "[]"
 
     real_runtime_int = db_mod.runtime_int
@@ -129,20 +130,28 @@ def test_find_ads_progress_callback():
             return 120
         return real_runtime_int(key, **kwargs)
 
+    # Transcript with no heuristic hits so LLM runs on all chunks.
+    plain = {
+        "sentences": [
+            {"text": "Baseball talk one.", "start": 0.0, "end": 10.0},
+            {"text": "Baseball talk two longer filler text here.", "start": 10.0, "end": 20.0},
+            {"text": "Baseball talk three even more filler.", "start": 20.0, "end": 30.0},
+        ]
+    }
+
     with (
-        patch.object(seed_mod, "ad_provider", return_value="zen"),
         patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
-        patch.object(seed_mod, "_llm_call", side_effect=fake_responses),
+        patch.object(seed_mod, "_chat_completions", side_effect=fake_chat),
         patch.object(db_mod, "runtime_int", side_effect=fake_runtime_int),
     ):
-        seed_mod.find_ads_with_zen(FIXTURE_TRANSCRIPT, progress_cb=lambda d, t: seen.append((d, t)))
+        seed_mod.find_ads_with_zen(plain, progress_cb=lambda d, t: seen.append((d, t)))
     assert seen, "callback never fired"
     assert [d for d, _ in seen] == list(range(1, len(seen) + 1))
     assert len({t for _, t in seen}) == 1, "total must be stable across chunks"
 
 
-def test_default_chunk_chars_fit_rate_limit():
+def test_default_chunk_chars_reasonable():
     from podaddeduct.config import Settings
 
     default = Settings.model_fields["zen_chunk_chars"].default
-    assert default <= 6000, f"default {default} chars risks TPM 429s on every request"
+    assert 1000 <= default <= 20000

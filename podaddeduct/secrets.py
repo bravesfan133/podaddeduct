@@ -129,5 +129,5 @@ def zen_key_status() -> dict:
         "configured": bool(stored or env or auth_fallback),
         "source": source,
         "hint": hint,
-        "model": _db.runtime_str("zen_model"),
+        "model": _db.runtime_str("zen_model") or "big-pickle",
     }

@@ -49,8 +49,7 @@ class Settings(BaseSettings):
     # Optional shared password when exposed via tunnel (empty = no login locally).
     app_password: str = ""
 
-    # Drea-style seed: local Parakeet + OpenCode Zen
-    seed_on_first_download: bool = True
+    # Local Parakeet (Mac) / faster-whisper (Linux) + OpenCode Zen chat for ads.
     stt_python: str = "./.venv-stt/bin/python"
     stt_sidecar: str = "./scripts/stt_sidecar.py"
     stt_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -59,18 +58,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ZEN_API_KEY", "OPENCODE_API_KEY", "zen_api_key"),
     )
     zen_base_url: str = "https://opencode.ai/zen/v1"
-    # Muse Spark 1.3 Free (API id). Responses-only — chat/completions returns 500.
-    zen_model: str = "muse-spark-1.3-contributor-free"
-    zen_fallback_model: str = "deepseek-v4-flash-free"
+    # Free chat/completions models (not Responses-only Muse Spark).
+    zen_model: str = "big-pickle"
+    zen_fallback_model: str = "mimo-v2.5-free"
     zen_auth_path: str = "~/.local/share/opencode/auth.json"
-    zen_chunk_chars: int = 6000
-    # Ad-detection LLM provider ("groq" or "zen") + Groq chat models.
-    llm_provider: str = "groq"
-    groq_llm_model: str = "openai/gpt-oss-120b"
-    groq_llm_fallback_model: str = "openai/gpt-oss-20b"
-    # When /responses returns MissingSessionID for free models, call OpenCode CLI.
-    opencode_bin: str = "opencode"
-    opencode_model: str = "opencode/muse-spark-1.3-contributor-free"
+    zen_chunk_chars: int = 8000
     silence_snap_window: float = 1.5
 
     def zen_models_to_try(self) -> list[str]:

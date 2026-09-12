@@ -53,22 +53,23 @@ def _ok_choices(text):
     return _FakeResp(200, {"choices": [{"message": {"content": text}}]})
 
 
-def test_groq_chat_success(tmp_path, monkeypatch):
+def test_zen_chat_success(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
     _FakeClient.instances.clear()
     fake = _FakeClient([_ok_choices('[{"start": 1, "end": 2}]')])
     with patch.object(seed_mod.httpx, "Client", return_value=fake):
-        out = seed_mod._groq_chat("k", "openai/gpt-oss-120b", "hi")
+        out = seed_mod._chat_completions("k", "big-pickle", "hi")
     assert out == '[{"start": 1, "end": 2}]'
     url, kwargs = fake.posts[0]
-    assert url == "https://api.groq.com/openai/v1/chat/completions"
+    assert url.endswith("/chat/completions")
     assert kwargs["headers"]["Authorization"] == "Bearer k"
-    assert kwargs["json"]["model"] == "openai/gpt-oss-120b"
+    assert kwargs["json"]["model"] == "big-pickle"
+    assert kwargs["json"]["max_tokens"] == seed_mod.CHAT_MAX_TOKENS
 
 
-def test_groq_chat_retries_429_then_succeeds(tmp_path, monkeypatch):
+def test_zen_chat_retries_429_then_succeeds(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from podaddeduct import seed as seed_mod
 
@@ -81,13 +82,13 @@ def test_groq_chat_retries_429_then_succeeds(tmp_path, monkeypatch):
         patch.object(seed_mod.httpx, "Client", return_value=fake),
         patch("time.sleep", side_effect=lambda s: sleeps.append(s)),
     ):
-        out = seed_mod._groq_chat("k", "m", "hi")
+        out = seed_mod._chat_completions("k", "m", "hi")
     assert out == "[]"
     assert len(fake.posts) == 2
     assert sleeps, "expected a backoff sleep between attempts"
 
 
-def test_groq_chat_fatal_401_raises(tmp_path, monkeypatch):
+def test_zen_chat_fatal_401_raises(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     import pytest
 
@@ -96,64 +97,73 @@ def test_groq_chat_fatal_401_raises(tmp_path, monkeypatch):
     fake = _FakeClient([_FakeResp(401, text="bad key")])
     with patch.object(seed_mod.httpx, "Client", return_value=fake):
         with pytest.raises(Exception, match="401"):
-            seed_mod._groq_chat("k", "m", "hi")
+            seed_mod._chat_completions("k", "m", "hi")
     assert len(fake.posts) == 1
 
 
-def test_ad_models_default_to_groq(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import seed as seed_mod
-
-    assert seed_mod.ad_provider() == "groq"
-    assert seed_mod.ad_models_to_try() == [
-        ("groq", "openai/gpt-oss-120b"),
-        ("groq", "openai/gpt-oss-20b"),
-    ]
-
-
-def test_ad_models_follow_provider_setting(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import seed as seed_mod
-
-    db.set_global_settings({"llm_provider": "zen"})
-    assert seed_mod.ad_provider() == "zen"
-    models = seed_mod.ad_models_to_try()
-    assert models and all(p == "zen" for p, _ in models)
-
-
-def test_find_ads_uses_groq_models(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import seed as seed_mod
-    from podaddeduct.stt import chunk_transcript_lines  # noqa: F401  (import surface)
-
-    transcript = {"sentences": [{"text": "Sponsored by Acme.", "start": 4.0, "end": 30.0}]}
-    calls = []
-
-    def fake_llm(provider, api_key, model, user_content):
-        calls.append((provider, model))
-        return '[{"start": 4.0, "end": 30.0}]'
-
-    with (
-        patch.object(seed_mod, "resolve_ad_api_key", return_value="gsk-test"),
-        patch.object(seed_mod, "_llm_call", side_effect=fake_llm),
-    ):
-        ads = seed_mod.find_ads_with_zen(transcript)
-    assert len(ads) == 1
-    assert calls and calls[0][0] == "groq"
-
-
-def test_find_ads_groq_missing_key_errors_helpfully(tmp_path, monkeypatch):
+def test_zen_chat_session_error_is_actionable(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     import pytest
 
     from podaddeduct import seed as seed_mod
 
-    with patch.object(seed_mod, "resolve_ad_api_key", return_value=None):
-        with pytest.raises(RuntimeError, match="Groq API key"):
-            seed_mod.find_ads_with_zen({"sentences": []})
+    fake = _FakeClient([_FakeResp(400, text='{"error":"MissingSessionID only be used in OpenCode"}')])
+    with patch.object(seed_mod.httpx, "Client", return_value=fake):
+        with pytest.raises(RuntimeError, match="big-pickle"):
+            seed_mod._chat_completions("k", "muse-spark-1.3-contributor-free", "hi")
 
 
-def test_settings_save_accepts_provider_keys(tmp_path, monkeypatch):
+def test_ad_models_default_to_zen_free(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    assert seed_mod.ad_models_to_try() == ["big-pickle", "mimo-v2.5-free"]
+
+
+def test_ad_models_skip_muse_spark_contributor(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    db.set_global_settings({
+        "zen_model": "muse-spark-1.3-contributor-free",
+        "zen_fallback_model": "big-pickle",
+    })
+    assert seed_mod.ad_models_to_try() == ["big-pickle"]
+
+
+def test_find_ads_uses_zen_models(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from podaddeduct import seed as seed_mod
+
+    # No heuristic hits — forces LLM path.
+    transcript = {"sentences": [{"text": "Talking about baseball all day.", "start": 4.0, "end": 30.0}]}
+    calls = []
+
+    def fake_chat(api_key, model, user_content):
+        calls.append(model)
+        return '[{"start": 4.0, "end": 30.0}]'
+
+    with (
+        patch.object(seed_mod, "resolve_zen_api_key", return_value="sk-test"),
+        patch.object(seed_mod, "_chat_completions", side_effect=fake_chat),
+    ):
+        ads = seed_mod.find_ads_with_zen(transcript)
+    assert len(ads) == 1
+    assert calls and calls[0] == "big-pickle"
+
+
+def test_find_ads_missing_key_errors_helpfully(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    import pytest
+
+    from podaddeduct import seed as seed_mod
+
+    with patch.object(seed_mod, "resolve_zen_api_key", return_value=None):
+        with pytest.raises(RuntimeError, match="Zen API key"):
+            seed_mod.find_ads_with_llm({"sentences": [{"text": "hello", "start": 0, "end": 1}]})
+
+
+def test_settings_save_accepts_zen_models(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from fastapi.testclient import TestClient
 
@@ -162,36 +172,10 @@ def test_settings_save_accepts_provider_keys(tmp_path, monkeypatch):
     with TestClient(app) as client:
         r = client.post(
             "/settings/global",
-            data={"settings_form": "1", "llm_provider": "groq",
-                  "groq_llm_model": "openai/gpt-oss-120b",
-                  "groq_llm_fallback_model": "openai/gpt-oss-20b"},
+            data={"settings_form": "1", "zen_model": "big-pickle",
+                  "zen_fallback_model": "mimo-v2.5-free"},
             follow_redirects=False,
         )
         assert r.status_code == 303
-    assert db.runtime_str("llm_provider") == "groq"
-    assert db.runtime_str("groq_llm_model") == "openai/gpt-oss-120b"
-
-    with TestClient(app) as client:
-        r = client.post(
-            "/settings/global",
-            data={"settings_form": "1", "llm_provider": "bogus"},
-            follow_redirects=False,
-        )
-        assert r.status_code == 303
-        assert "err=" in r.headers["location"]
-    assert db.runtime_str("llm_provider") == "groq"
-
-
-def test_dead_groq_models_auto_heal(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
-    from podaddeduct import seed as seed_mod
-
-    db.set_global_settings({
-        "llm_provider": "groq",
-        "groq_llm_model": "llama-3.3-70b-versatile",
-        "groq_llm_fallback_model": "llama-3.1-8b-instant",
-    })
-    assert seed_mod.ad_models_to_try() == [
-        ("groq", "openai/gpt-oss-120b"),
-        ("groq", "openai/gpt-oss-20b"),
-    ]
+    assert db.runtime_str("zen_model") == "big-pickle"
+    assert db.runtime_str("zen_fallback_model") == "mimo-v2.5-free"

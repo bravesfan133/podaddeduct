@@ -187,11 +187,16 @@ async def sync_feed_episodes(
         db.update_feed_artwork(feed.id, art)
 
     from .ptranscript import parse_transcript_tags
+    from .chapters import chapters_url_for_entry, parse_chapters_tags
 
     try:
         tmap = parse_transcript_tags(raw)
     except Exception:
         tmap = {}
+    try:
+        cmap = parse_chapters_tags(raw)
+    except Exception:
+        cmap = {}
     items: list[dict] = []
     for entry in parsed.entries:
         enclosure = entry_enclosure(entry)
@@ -206,12 +211,14 @@ async def sync_feed_episodes(
                 "pub_date": entry_pub_date(entry),
                 "transcript_url": turl,
                 "transcript_type": ttype,
+                "chapters_url": chapters_url_for_entry(entry, enclosure, cmap),
             }
         )
     episodes = db.upsert_episodes_batch(feed.id, items)
 
     fs = db.get_feed_settings(feed)
-    auto_on = fs.get("auto_download", True) and db.runtime_bool("auto_prepare_latest")
+    # Per-show toggle is the single auto-prepare control.
+    auto_on = bool(fs.get("auto_download", True))
     should_queue = queue_recent or (autodl and auto_on)
     if should_queue and episodes:
         # Only the newest unprepared episode(s) — never the whole back-catalog.
@@ -399,14 +406,10 @@ async def settings_page(request: Request) -> HTMLResponse:
         "min_ad_seconds": db.runtime_float("min_ad_seconds", minimum=1.0, maximum=300.0),
         "silence_snap_window": db.runtime_float("silence_snap_window", minimum=0.0, maximum=10.0),
         "delete_original_after_cut": db.runtime_bool("delete_original_after_cut"),
-        "auto_prepare_latest": db.runtime_bool("auto_prepare_latest"),
         "zen_model": db.runtime_str("zen_model"),
         "zen_fallback_model": db.runtime_str("zen_fallback_model"),
         "zen_base_url": db.runtime_str("zen_base_url"),
         "zen_chunk_chars": db.runtime_int("zen_chunk_chars", minimum=1000),
-        "llm_provider": db.runtime_str("llm_provider"),
-        "groq_llm_model": db.runtime_str("groq_llm_model"),
-        "groq_llm_fallback_model": db.runtime_str("groq_llm_fallback_model"),
         "stt_python": db.runtime_str("stt_python"),
         "stt_sidecar": db.runtime_str("stt_sidecar"),
         "stt_model": db.runtime_str("stt_model"),
@@ -605,17 +608,10 @@ async def save_global_settings(request: Request) -> RedirectResponse:
             maximum=500 if k == "feed_item_limit" else (10**6 if k == "zen_chunk_chars" else 1440 if k == "poll_minutes" else 365 if k == "delete_after_days" else 50))
 
     for k in ("zen_model", "zen_fallback_model", "zen_base_url",
-              "groq_llm_model", "groq_llm_fallback_model",
               "stt_python", "stt_sidecar", "stt_model"):
         raw = form.get(k)
         if raw not in (None, ""):
             updates[k] = str(raw).strip()
-
-    provider = str(form.get("llm_provider") or "").strip().lower()
-    if provider in ("groq", "zen"):
-        updates["llm_provider"] = provider
-    elif provider:
-        errors.append("Unknown ad-detection provider (pick Groq or Zen).")
 
     raw_base = str(form.get("public_base_url") or "").strip().rstrip("/")
     if raw_base:
@@ -648,7 +644,7 @@ async def save_global_settings(request: Request) -> RedirectResponse:
     elif form.get("public_base_url") == "":
         updates["public_base_url"] = ""
 
-    for k in ("auto_prepare_latest", "delete_original_after_cut"):
+    for k in ("delete_original_after_cut",):
         if k in form:
             updates[k] = "true" if str(form.get(k)).lower() in {"1", "on", "true"} else "false"
         elif form.get("settings_form"):
@@ -782,8 +778,6 @@ async def save_show_settings(slug: str, request: Request) -> RedirectResponse:
             updates["keep_last"] = max(1, min(50, int(str(form.get("keep_last")))))
         except ValueError:
             pass
-    if form.get("mode") in ("cut", "chapters"):
-        updates["mode"] = str(form.get("mode"))
     if updates:
         db.update_feed_settings(feed.id, updates)
         from .retain import run_janitor
@@ -949,8 +943,8 @@ async def audio(episode_id: int, request: Request) -> Response:
 
     - HEAD: report upstream headers only, queue nothing (feed refreshes).
     - GET with a clean file: serve it (206 range support via FileResponse).
-    - GET with a finished original and nothing to cut (no ads found, or the
-      show is in chapters mode): serve the original.
+    - GET with a finished original and nothing to cut (no ads found): serve
+      the original.
     - GET otherwise: queue at the front and answer 503 + Retry-After so the
       player keeps retrying until the clean file is ready. Never redirects
       to the publisher's with-ads file.

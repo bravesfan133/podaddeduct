@@ -68,7 +68,7 @@
     {% elif episode.status == 'error' %}
     <p class="muted" style="margin:0.35rem 0 0">Last attempt failed — see above, then press Prepare to retry.</p>
     {% else %}
-    <p class="muted" style="margin:0.35rem 0 0">Original audio (no ads found, or chapters-only mode).</p>
+    <p class="muted" style="margin:0.35rem 0 0">Original audio (no ads found).</p>
     {% endif %}
     {% if has_audio and (has_clean or episode.status in ('ready', 'manual')) %}<audio id="player" controls preload="metadata" src="/audio/{{ episode.id }}"></audio>{% endif %}
     <p class="muted" id="nowPlaying" style="margin-bottom:0"></p>
@@ -80,8 +80,8 @@
 
   {% if not zen.configured %}
   <div class="player">
-    <b>One-time setup: ad-detection key</b>
-    <p class="muted">Needed so the app can spot sponsor reads. <a href="https://opencode.ai/auth" target="_blank" rel="noopener">Get a key</a>, paste it, then Re-check.</p>
+    <b>One-time setup: Zen API key</b>
+    <p class="muted">Needed so the app can spot sponsor reads when the publisher didn't mark them. <a href="https://opencode.ai/auth" target="_blank" rel="noopener">Get a key</a>, paste it, then Re-check.</p>
     <form method="post" action="/settings/zen-key">
       <input name="zen_api_key" type="password" autocomplete="off" placeholder="Paste key…" />
       <p><button type="submit">Save key</button></p>

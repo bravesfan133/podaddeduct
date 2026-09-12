@@ -94,7 +94,7 @@ def run_janitor() -> dict:
 
     for feed in db.list_feeds():
         settings = db.get_feed_settings(feed)
-        # "chapters" mode stores ~nothing; still enforce counts for safety.
+        # "chapters" mode was removed; keep counts for safety on all shows.
         keep = max(1, int(settings.get("keep_last", default_keep) or default_keep))
         eps = db.list_episodes(feed.id)
         # Newest first (id DESC). Anything past `keep` with files on disk goes.

@@ -40,6 +40,7 @@ class Episode:
     pub_ts: float = 0.0
     transcript_url: str | None = None
     transcript_type: str | None = None
+    chapters_url: str | None = None
     duration_seconds: float | None = None
     status: str = "pending"
     audio_path: str | None = None
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     pub_ts REAL NOT NULL DEFAULT 0,
     transcript_url TEXT,
     transcript_type TEXT,
+    chapters_url TEXT,
     duration_seconds REAL,
     status TEXT NOT NULL DEFAULT 'pending',
     audio_path TEXT,
@@ -127,6 +129,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE episodes ADD COLUMN transcript_url TEXT")
     if "transcript_type" not in ep_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN transcript_type TEXT")
+    if "chapters_url" not in ep_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN chapters_url TEXT")
     # Backfill sortable timestamps for rows written before pub_ts existed.
     try:
         stale = conn.execute(
@@ -188,6 +192,7 @@ def _episode_from_row(row: sqlite3.Row) -> Episode:
         pub_ts=float(row["pub_ts"] or 0.0) if "pub_ts" in keys else 0.0,
         transcript_url=row["transcript_url"] if "transcript_url" in keys else None,
         transcript_type=row["transcript_type"] if "transcript_type" in keys else None,
+        chapters_url=row["chapters_url"] if "chapters_url" in keys else None,
         duration_seconds=row["duration_seconds"],
         status=row["status"],
         audio_path=row["audio_path"],
@@ -278,6 +283,7 @@ def upsert_episode(
     pub_date: str | None,
     transcript_url: str | None = None,
     transcript_type: str | None = None,
+    chapters_url: str | None = None,
 ) -> Episode:
     existing = get_episode_by_guid(feed_id, guid)
     now = _utc_now()
@@ -291,22 +297,24 @@ def upsert_episode(
                     """
                     UPDATE episodes
                     SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?,
-                        transcript_url = ?, transcript_type = ?,
+                        transcript_url = ?, transcript_type = ?, chapters_url = ?,
                         audio_path = NULL, status = 'pending', error = NULL,
                         ad_ranges_json = '[]', clean_audio_path = NULL
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type,
+                     chapters_url, existing.id),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE episodes
                     SET title = ?, enclosure_url = ?, pub_date = ?, pub_ts = ?, updated_at = ?,
-                        transcript_url = ?, transcript_type = ?
+                        transcript_url = ?, transcript_type = ?, chapters_url = ?
                     WHERE id = ?
                     """,
-                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type, existing.id),
+                    (title, enclosure_url, pub_date, ts, now, transcript_url, transcript_type,
+                     chapters_url, existing.id),
                 )
         ep = get_episode(existing.id)
         assert ep is not None
@@ -317,11 +325,12 @@ def upsert_episode(
             """
             INSERT INTO episodes (
                 feed_id, guid, title, enclosure_url, pub_date, pub_ts,
-                transcript_url, transcript_type,
+                transcript_url, transcript_type, chapters_url,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             """,
-            (feed_id, guid, title, enclosure_url, pub_date, ts, transcript_url, transcript_type, now),
+            (feed_id, guid, title, enclosure_url, pub_date, ts, transcript_url, transcript_type,
+             chapters_url, now),
         )
         episode_id = int(cur.lastrowid)
     ep = get_episode(episode_id)
@@ -337,7 +346,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
     with a single commit: well under a second. Same per-row semantics as
     upsert_episode (enclosure change resets processing state).
     Items: dicts with guid/title/enclosure_url/pub_date keys
-    (plus optional transcript_url/transcript_type).
+    (plus optional transcript_url/transcript_type/chapters_url).
     """
     now = _utc_now()
     rows = [
@@ -349,6 +358,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             pub_ts_for(it.get("pub_date")),
             it.get("transcript_url"),
             it.get("transcript_type"),
+            it.get("chapters_url"),
         )
         for it in items
         if it.get("guid") and it.get("enclosure_url")
@@ -360,9 +370,9 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
             """
             INSERT INTO episodes (
                 feed_id, guid, title, enclosure_url, pub_date, pub_ts,
-                transcript_url, transcript_type,
+                transcript_url, transcript_type, chapters_url,
                 status, ad_ranges_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '[]', ?)
             ON CONFLICT(feed_id, guid) DO UPDATE SET
                 title = excluded.title,
                 enclosure_url = excluded.enclosure_url,
@@ -370,6 +380,7 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
                 pub_ts = excluded.pub_ts,
                 transcript_url = excluded.transcript_url,
                 transcript_type = excluded.transcript_type,
+                chapters_url = excluded.chapters_url,
                 updated_at = excluded.updated_at,
                 audio_path = CASE
                     WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
@@ -387,7 +398,10 @@ def upsert_episodes_batch(feed_id: int, items: list[dict]) -> list[Episode]:
                     WHEN episodes.enclosure_url != excluded.enclosure_url THEN NULL
                     ELSE episodes.error END
             """,
-            [(feed_id, guid, title, enc, pub, ts, turl, ttype, now) for (guid, title, enc, pub, ts, turl, ttype) in rows],
+            [
+                (feed_id, guid, title, enc, pub, ts, turl, ttype, curl, now)
+                for (guid, title, enc, pub, ts, turl, ttype, curl) in rows
+            ],
         )
         sel = conn.execute(
             f"SELECT * FROM episodes WHERE feed_id = ? AND guid IN ({','.join('?' * len(rows))})",
@@ -456,7 +470,6 @@ DEFAULT_FEED_SETTINGS: dict[str, Any] = {
     # None = inherit the global keep_last_n. New shows always inherit;
     # clearing the field on the show page reverts to inherit.
     "keep_last": None,  # how many recent cleaned episodes to keep
-    "mode": "cut",  # "cut" = remove ads from file, "chapters" = mark only, ~0 storage
 }
 
 
@@ -570,15 +583,11 @@ GLOBAL_DEFAULTS: dict[str, str] = {
     "silence_snap_window": "",
     "delete_original_after_cut": "",
     "auto_prepare_latest": "",
-    # Ad detection (OpenCode Zen)
+    # Ad detection (OpenCode Zen chat/completions)
     "zen_model": "",
     "zen_fallback_model": "",
     "zen_base_url": "",
     "zen_chunk_chars": "",
-    # Ad-detection LLM provider + Groq models
-    "llm_provider": "",
-    "groq_llm_model": "",
-    "groq_llm_fallback_model": "",
     # Transcription backend
     "stt_python": "",
     "stt_sidecar": "",
@@ -602,9 +611,6 @@ _RUNTIME_ATTRS: dict[str, str] = {
     "zen_fallback_model": "zen_fallback_model",
     "zen_base_url": "zen_base_url",
     "zen_chunk_chars": "zen_chunk_chars",
-    "llm_provider": "llm_provider",
-    "groq_llm_model": "groq_llm_model",
-    "groq_llm_fallback_model": "groq_llm_fallback_model",
     "stt_python": "stt_python",
     "stt_sidecar": "stt_sidecar",
     "stt_model": "stt_model",

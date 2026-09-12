@@ -53,12 +53,6 @@
       <div class="row">
         <div><label><input type="checkbox" name="auto_download" value="1" {% if feed_settings.auto_download %}checked{% endif %} /> Prepare new episodes automatically</label></div>
         <div><label>Keep latest <span class="muted">(empty = global: {{ keep_last_global }})</span></label><input type="number" name="keep_last" min="1" max="50" value="{{ keep_last_raw or '' }}" placeholder="{{ keep_last_global }}" /></div>
-        <div><label>Remove ads by</label>
-          <select name="mode">
-            <option value="cut" {% if feed_settings.mode=='cut' %}selected{% endif %}>Cut them out (recommended)</option>
-            <option value="chapters" {% if feed_settings.mode=='chapters' %}selected{% endif %}>Mark chapters only (uses ~no space)</option>
-          </select>
-        </div>
       </div>
       <p><button type="submit">Save</button></p>
     </form>

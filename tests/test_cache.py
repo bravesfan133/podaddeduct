@@ -21,10 +21,9 @@ def test_feed_settings_roundtrip(tmp_path, monkeypatch):
     defaults = db.get_feed_settings(feed)
     assert defaults["auto_download"] is True
     assert defaults["keep_last"] == 5
-    assert defaults["mode"] == "cut"
-    updated = db.update_feed_settings(feed.id, {"keep_last": 2, "mode": "chapters"})
+    updated = db.update_feed_settings(feed.id, {"keep_last": 2, "auto_download": False})
     assert db.get_feed_settings(updated)["keep_last"] == 2
-    assert db.get_feed_settings(updated)["mode"] == "chapters"
+    assert db.get_feed_settings(updated)["auto_download"] is False
 
 
 def test_global_settings_roundtrip(tmp_path, monkeypatch):

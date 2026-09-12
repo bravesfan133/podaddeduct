@@ -1,6 +1,6 @@
 # podaddeduct
 
-Your podcasts, without the ads. Download → transcribe → find sponsor reads → cut → clean RSS for your phone.
+Your podcasts, without the ads. Download → find sponsor reads → cut → clean RSS for your phone.
 
 ## Use it (2 minutes)
 
@@ -12,9 +12,10 @@ cp -n .env.example .env 2>/dev/null || true
 
 Open `http://127.0.0.1:8080/`:
 
-1. **Search** for a show by name, press Add.
-2. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
-3. **Play.** A new episode takes a few minutes to clean once; afterwards it's instant.
+1. **Paste your OpenCode Zen API key** once in Settings (gear icon) — free chat models spot ads when needed.
+2. **Search** for a show by name, press Add.
+3. **Copy its link** → iPhone Podcasts → Library → **…** → **Follow a Show by URL** → paste. (Phone + computer on the same Wi-Fi.)
+4. **Play.** New episodes prepare automatically; first play waits until the clean file is ready (never streams the with-ads original). Afterwards it's instant.
 
 ## How it stays small
 
@@ -24,28 +25,24 @@ podaddeduct is a **cache, not an archive** (default 3 GB):
 - Each show keeps only its latest 5 episodes; anything older than 14 days goes.
 - Re-requesting a deleted episode re-downloads and re-cuts from saved marks in seconds — no extra AI cost.
 - Tune it in **Settings**: max storage, keep-latest, delete-after, check-for-new interval.
-- Per show: automatic preparation on/off, keep-latest, and **chapters-only mode** (marks ads, stores ~nothing).
+- Per show: automatic prepare on/off and keep-latest.
 
-While an episode is still being cleaned, the app plays the publisher's original so playback never blocks. Podcast-app refresh checks (`HEAD`) never start work.
+Podcast-app refresh checks (`HEAD`) never start work. First play of an unprepared episode returns **503** until cleaning finishes — turn on auto-prepare so that wait is rare.
 
 ## Ad detection
 
-Transcription + OpenCode Zen to spot sponsor reads, snapped to silence, cut with ffmpeg. Everything is configured in **Settings** (gear icon, top right) — no config files needed:
+Cheapest path first:
 
-- **Ad detection card:** paste the API key once, pick the model (listed from your key), Test button proves it works.
-- **Server card:** transcription backend shortcut (Mac Parakeet / Linux faster-whisper / Groq cloud), Groq API key, public address for Overcast, family password.
-- **Processing card:** how many episodes to prepare, shortest ad to cut, auto-prepare on/off.
+1. **Publisher chapters** with Ad/Sponsor titles → cut immediately (no AI).
+2. **Publisher transcript** in the RSS (free) → else local STT (Parakeet on Mac / faster-whisper on Linux) → else optional Groq Whisper.
+3. Cheap **sponsor-read heuristics**, then **OpenCode Zen** chat/completions (`big-pickle` / `mimo-v2.5-free`) on leftover spans only.
+4. Snap to silence, cut with ffmpeg.
 
-Transcripts come from the fastest available source, automatically: publisher-provided file in the RSS feed when one exists (free, instant) → Groq Whisper API (~1–2 min, needs free key from console.groq.com) → local faster-whisper on CPU.
+Everything is configured in **Settings** — no config files needed:
 
-- **Mac dev:** local Parakeet transcription (Apple Silicon sidecar):
-
-```bash
-python3.12 -m venv .venv-stt
-.venv-stt/bin/pip install parakeet-mlx
-```
-
-- **Linux / home server:** `faster-whisper` on CPU (`STT_MODEL=base` default, `tiny` if the CPU is slow). The Docker image includes it.
+- **Ad detection:** paste the Zen API key once, Test button proves it works. Model overrides are under Advanced.
+- **Server:** transcription backend (Mac Parakeet / Linux faster-whisper / optional Groq Whisper), Groq key for cloud STT only, public address for Overcast, family password.
+- **Processing:** how many episodes to prepare, shortest ad to cut.
 
 ## Home server (Docker)
 
