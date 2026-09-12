@@ -23,11 +23,9 @@ services:
       GEMINI_MODEL: gemini-3.5-flash
     devices:
       # Pass N100 iGPU for ffmpeg VAAPI decode when codecs allow.
+      # Root in the container can open renderD128; do not use named
+      # group_add (host may lack a `render` group and Compose fails).
       - /dev/dri:/dev/dri
-    group_add:
-      # GIDs must match host `getent group video render` if non-standard.
-      - video
-      - render
     volumes:
       - podaddeduct-data:/data
     restart: unless-stopped

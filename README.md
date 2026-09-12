@@ -54,9 +54,7 @@ docker compose up -d --build
 
 Data (DB, audio, transcripts) lives in the `podaddeduct-data` volume. The app serves port **7887**: point your Cloudflare Tunnel hostname at `http://localhost:7887` (tunnel on the same machine) and set that `https://…` URL as the public address in Settings.
 
-Compose passes through the N100 iGPU (`/dev/dri`, `LIBVA_DRIVER_NAME=iHD`) so ffmpeg can use **VAAPI decode** when the codec allows. Chromaprint (`fpcalc`), Groq, Gemini, and MP3 encoding stay on CPU — Quick Sync does not encode MP3. Idle process list should be uvicorn only (no OpenCode).
-
-If `getent group render video` on the host shows non-standard GIDs, adjust `group_add` in `compose.yaml`.
+Compose passes through the N100 iGPU (`/dev/dri`, `LIBVA_DRIVER_NAME=iHD`) so ffmpeg can use **VAAPI decode** when the codec allows. Device passthrough is enough (the container runs as root). Chromaprint (`fpcalc`), Groq, Gemini, and MP3 encoding stay on CPU — Quick Sync does not encode MP3. Idle process list should be uvicorn only (no OpenCode). If `/dev/dri` is missing on the host, Compose will fail on `devices` and VAAPI stays off.
 
 ## Outside home Wi-Fi / Overcast
 
